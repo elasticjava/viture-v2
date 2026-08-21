@@ -167,7 +167,17 @@ impl Usbfs {
         )
         .is_ok();
 
-        sys::ioctl(fd, claiminterface(), &ifno as *const i32 as usize).map_err(Error::Io)?;
+        // EBUSY means somebody already holds the interface on this descriptor.
+        // Android's UsbDeviceConnection does exactly that when the app calls
+        // openDevice(), and since it is the *same* descriptor the claim is
+        // already ours — URBs submit fine. Treating that as failure is what kept
+        // head tracking dead inside the app while the identical code worked from
+        // Termux, where termux-usb hands over an unclaimed descriptor.
+        match sys::ioctl(fd, claiminterface(), &ifno as *const i32 as usize) {
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(16) => {}
+            Err(e) => return Err(Error::Io(e)),
+        }
 
         let mut u = Usbfs {
             fd,
