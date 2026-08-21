@@ -1,21 +1,21 @@
-//! io_uring-Transport: ein Ring vorab bewaffneter Lesepuffer.
+//! io_uring transport: a ring of pre-armed read buffers.
 //!
-//! Prinzip: `DEPTH` Reads stehen dauerhaft beim Kernel. Kommt ein Report,
-//! landet er in dem Puffer, der zu der Completion gehört; wir reichen ihn nach
-//! oben und bewaffnen denselben Puffer sofort neu. Zwischen zwei Reports wird
-//! nie gepollt und nie geschlafen — `io_uring_enter` legt den Thread schlafen,
-//! bis der Kernel etwas hat.
+//! The idea: `DEPTH` reads sit queued in the kernel at all times. When a report
+//! arrives it lands in the buffer belonging to that completion; we hand it up
+//! and immediately re-arm the same buffer. Between two reports nothing is
+//! polled and nothing sleeps — `io_uring_enter` parks the thread until the
+//! kernel has something.
 //!
-//! Auf Android ist `io_uring_setup` per seccomp gesperrt (ENOSYS/EPERM). Dort
-//! greift der blockierende Transport in [`crate::hidraw`], der dieselbe
-//! Semantik ohne Ring liefert.
+//! On Android `io_uring_setup` is blocked by seccomp (ENOSYS/EPERM). There the
+//! blocking transport in [`crate::hidraw`] or the URB ring in
+//! [`crate::usbfs`] provides the same semantics.
 
 use core::sync::atomic::{fence, Ordering};
 
 use crate::sys;
 use crate::{Error, Result, Transport, FRAME_MAX};
 
-/// Anzahl gleichzeitig beim Kernel liegender Reads.
+/// Number of reads queued in the kernel at once.
 pub const DEPTH: usize = 16;
 
 const IORING_OP_READ: u8 = 22;
@@ -80,7 +80,7 @@ struct GetEventsArg {
     ts: u64,
 }
 
-/// Zählt, was tatsächlich in den Kernel geht — die interessante Kennzahl.
+/// Counts what actually enters the kernel — the metric that matters.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Stats {
     pub enters: u64,
@@ -113,13 +113,13 @@ pub struct Uring {
 }
 
 impl Uring {
-    /// Legt den Ring an und bewaffnet alle Lesepuffer.
+    /// Creates the ring and arms every read buffer.
     ///
-    /// `dev_fd` muss offen bleiben, solange der Ring lebt.
+    /// `dev_fd` must stay open for as long as the ring lives.
     pub fn new(dev_fd: i32) -> Result<Self> {
-        // Bewusst ohne SINGLE_ISSUER/DEFER_TASKRUN: die binden den Ring an
-        // genau eine Task, unser Kommandopfad läuft aber vor dem Umzug in den
-        // Lese-Thread. Der Gewinn wäre hier ohnehin klein.
+        // Deliberately without SINGLE_ISSUER/DEFER_TASKRUN: those bind the
+        // ring to one task, but our command path runs before the move into the
+        // reader thread. The gain would be small here anyway.
         let mut p = Params::default();
         let entries = (DEPTH * 2) as u32;
         let ring_fd = unsafe {
@@ -150,7 +150,7 @@ impl Uring {
         let sqe_ptr = unsafe { sys::mmap(sqe_len, prot, flags, ring_fd, IORING_OFF_SQES) }
             .map_err(Error::Io)?;
 
-        // SAFETY: Offsets stammen vom Kernel und liegen innerhalb der Mappings.
+        // SAFETY: offsets come from the kernel and lie inside the mappings.
         let mut u = unsafe {
             Uring {
                 ring_fd,
@@ -179,17 +179,17 @@ impl Uring {
         Ok(u)
     }
 
-    /// Legt einen Read für Puffer `idx` in die Submission Queue.
+    /// Places a read for buffer `idx` into the submission queue.
     #[inline]
     fn arm(&mut self, idx: usize) {
         let slot = (self.sq_local_tail & self.sq_mask) as usize;
-        // SAFETY: slot liegt per Maske im Ring; SQE-Layout laut linux/io_uring.h.
+        // SAFETY: slot is masked into the ring; SQE layout per linux/io_uring.h.
         unsafe {
             let sqe = self.sqe_map.0.add(slot * SQE_SIZE);
             core::ptr::write_bytes(sqe, 0, SQE_SIZE);
             sqe.write(IORING_OP_READ);
             (sqe.add(4) as *mut i32).write(self.dev_fd);
-            (sqe.add(8) as *mut u64).write(u64::MAX); // off = -1: aktuelle Position
+            (sqe.add(8) as *mut u64).write(u64::MAX); // off = -1: current position
             (sqe.add(16) as *mut u64).write(self.bufs[idx].as_mut_ptr() as u64);
             (sqe.add(24) as *mut u32).write(FRAME_MAX as u32);
             (sqe.add(32) as *mut u64).write(idx as u64); // user_data
@@ -199,14 +199,14 @@ impl Uring {
         self.to_submit += 1;
     }
 
-    /// Veröffentlicht den lokalen Tail für den Kernel.
+    /// Publishes the local tail for the kernel.
     #[inline]
     fn publish(&mut self) {
         fence(Ordering::Release);
         unsafe { core::ptr::write_volatile(self.sq_tail, self.sq_local_tail) };
     }
 
-    /// Holt eine fertige Completion, ohne zu blockieren.
+    /// Takes one finished completion without blocking.
     #[inline]
     fn reap(&mut self) -> Option<(usize, i32)> {
         let head = unsafe { core::ptr::read_volatile(self.cq_head) };
@@ -216,7 +216,7 @@ impl Uring {
         }
         fence(Ordering::Acquire);
         let slot = (head & self.cq_mask) as usize;
-        // SAFETY: CQE-Layout: u64 user_data, i32 res, u32 flags.
+        // SAFETY: CQE layout is u64 user_data, i32 res, u32 flags.
         let (user_data, res) = unsafe {
             let e = self.cqes.add(slot * CQE_SIZE);
             ((e as *const u64).read(), (e.add(8) as *const i32).read())
@@ -227,7 +227,7 @@ impl Uring {
         Some((user_data as usize, res))
     }
 
-    /// Reicht Bewaffnungen ein und wartet auf mindestens eine Completion.
+    /// Submits pending arms and waits for at least one completion.
     fn submit_and_wait(&mut self, timeout_ns: u64) -> Result<()> {
         self.publish();
         let submit = core::mem::take(&mut self.to_submit);
@@ -268,9 +268,9 @@ impl Uring {
     }
 }
 
-// SAFETY: Die Zeiger adressieren Mappings, die exklusiv zu diesem Ring
-// gehören. `Uring` wird als Ganzes in genau einen Thread verschoben und dort
-// nur von diesem benutzt — geteilt wird er nie.
+// SAFETY: the pointers address mappings owned exclusively by this ring.
+// `Uring` is moved as a whole into exactly one thread and used only from
+// there — it is never shared.
 unsafe impl Send for Uring {}
 
 impl Drop for Uring {
@@ -289,8 +289,8 @@ impl Drop for Uring {
 impl Transport for Uring {
     #[inline]
     fn send(&mut self, frame: &[u8]) -> Result<()> {
-        // Schreiben geht direkt: ein einzelner kurzer Write pro Kommando,
-        // ein SQE dafür wäre teurer als der Syscall.
+        // Writing goes out directly: one short write per command. Spending
+        // an SQE on that would cost more than the syscall itself.
         let mut buf = [0u8; FRAME_MAX + 1];
         buf[1..1 + frame.len()].copy_from_slice(frame);
         sys::write(self.dev_fd, &buf[..1 + frame.len()]).map_err(Error::Io)?;
@@ -312,7 +312,7 @@ impl Transport for Uring {
                     self.arm(idx);
                     return Ok(n);
                 }
-                // Fehler oder EOF: Puffer neu bewaffnen und weitersuchen.
+                // Error or EOF: re-arm the buffer and keep looking.
                 self.arm(idx);
                 continue;
             }
@@ -324,7 +324,7 @@ impl Transport for Uring {
             }
             self.submit_and_wait(timeout_ns)?;
             if self.reap_is_empty() {
-                return Ok(0); // Zeitüberschreitung
+                return Ok(0); // timed out
             }
         }
     }

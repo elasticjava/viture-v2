@@ -1,21 +1,23 @@
-//! usbfs-Transport — derselbe Ring-Gedanke wie io_uring, aber überall erlaubt.
+//! usbfs transport — the same ring idea as io_uring, but permitted everywhere.
 //!
-//! `USBDEVFS_SUBMITURB` reiht Transfers ein, `USBDEVFS_REAPURBNDELAY` erntet
-//! fertige ab. Das ist eine Submission- und eine Completion-Queue, nur mit
-//! ioctls statt geteiltem Speicher. `DEPTH` Interrupt-IN-URBs liegen dauerhaft
-//! beim Kernel; jede Completion trägt ihren Puffer mit und wird sofort neu
-//! eingereiht.
+//! `USBDEVFS_SUBMITURB` queues transfers, `USBDEVFS_REAPURBNDELAY` collects
+//! finished ones. That is a submission queue and a completion queue, expressed
+//! as ioctls instead of shared memory. `DEPTH` interrupt-IN URBs sit in the
+//! kernel at all times; every completion carries its own buffer and is
+//! re-queued immediately.
 //!
-//! Das ist der Pfad für **Android/Termux**: `termux-usb -r -e prog /dev/bus/usb/...`
-//! liefert genau diesen Deskriptor, und io_uring ist dort per seccomp gesperrt.
+//! This is the path for **Android/Termux**: `termux-usb -r -e prog
+//! /dev/bus/usb/…` hands over exactly this descriptor, and io_uring is blocked
+//! by seccomp there — verified on a Pixel 9 running Android 17, where
+//! `io_uring_setup` returns EPERM even in the `shell` domain.
 //!
-//! Achtung: Der Kernel-Treiber (`usbhid`) muss vom Interface gelöst werden.
-//! Beim Verwerfen wird er zurückgegeben.
+//! Note that the kernel driver (`usbhid`) has to be detached from the
+//! interface. It is handed back on drop.
 
 use crate::sys;
 use crate::{Error, Result, Transport, FRAME_MAX};
 
-/// Gleichzeitig eingereihte Lese-URBs.
+/// Read URBs queued at once.
 pub const DEPTH: usize = 16;
 
 const EP_IN: u8 = 0x81;
@@ -24,7 +26,7 @@ const URB_TYPE_INTERRUPT: u8 = 1;
 
 const USBDEVFS_TYPE: u8 = b'U';
 
-/// `struct usbdevfs_urb` in der 64-Bit-Auslegung: 56 Byte.
+/// `struct usbdevfs_urb` in its 64-bit layout: 56 bytes.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Urb {
@@ -44,7 +46,7 @@ struct Urb {
     usercontext: *mut u8,
 }
 
-/// `struct usbdevfs_ioctl` — Träger für DISCONNECT/CONNECT.
+/// `struct usbdevfs_ioctl` — the carrier for DISCONNECT/CONNECT.
 #[repr(C)]
 struct UsbdevfsIoctl {
     ifno: i32,
@@ -68,7 +70,12 @@ fn releaseinterface() -> usize {
     sys::ioc(sys::IOC_READ, USBDEVFS_TYPE, 16, 4)
 }
 fn usbdevfs_ioctl() -> usize {
-    sys::ioc(sys::IOC_READ | sys::IOC_WRITE, USBDEVFS_TYPE, 18, core::mem::size_of::<UsbdevfsIoctl>())
+    sys::ioc(
+        sys::IOC_READ | sys::IOC_WRITE,
+        USBDEVFS_TYPE,
+        18,
+        core::mem::size_of::<UsbdevfsIoctl>(),
+    )
 }
 const IOCTL_DISCONNECT: i32 = 0x5516; // _IO('U', 22)
 const IOCTL_CONNECT: i32 = 0x5517; // _IO('U', 23)
@@ -81,10 +88,10 @@ pub struct Stats {
     pub max_batch: u32,
 }
 
-/// Sucht den usbfs-Knoten zur VID:PID und öffnet ihn.
+/// Finds the usbfs node for a VID:PID and opens it.
 ///
-/// Unter Termux entfällt das: dort kommt der Deskriptor fertig von
-/// `termux-usb -r -e`, weil `/dev/bus/usb` für Apps nicht durchsuchbar ist.
+/// Not needed under Termux: there the descriptor arrives ready-made from
+/// `termux-usb -r -e`, because `/dev/bus/usb` is not traversable for apps.
 pub fn find_fd(vid: u16, pid: u16) -> Result<i32> {
     use std::fs::{read_dir, read_to_string, OpenOptions};
     use std::os::fd::IntoRawFd;
@@ -92,9 +99,7 @@ pub fn find_fd(vid: u16, pid: u16) -> Result<i32> {
     for entry in read_dir("/sys/bus/usb/devices")? {
         let dir = entry?.path();
         let hex = |name: &str| {
-            read_to_string(dir.join(name))
-                .ok()
-                .and_then(|s| u16::from_str_radix(s.trim(), 16).ok())
+            read_to_string(dir.join(name)).ok().and_then(|s| u16::from_str_radix(s.trim(), 16).ok())
         };
         if hex("idVendor") != Some(vid) || hex("idProduct") != Some(pid) {
             continue;
@@ -109,15 +114,14 @@ pub fn find_fd(vid: u16, pid: u16) -> Result<i32> {
     }
     Err(Error::Io(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        "kein usbfs-Knoten mit passender VID:PID",
+        "no usbfs node with matching VID:PID",
     )))
 }
 
 pub struct Usbfs {
     fd: i32,
     ifno: i32,
-    /// Fest liegende Puffer; die URBs zeigen darauf, also dürfen sie sich
-    /// nicht bewegen.
+    /// Pinned buffers; the URBs point at them, so they must not move.
     bufs: Box<[[u8; FRAME_MAX]; DEPTH]>,
     urbs: Box<[Urb; DEPTH]>,
     out_buf: Box<[u8; FRAME_MAX]>,
@@ -127,15 +131,16 @@ pub struct Usbfs {
     pub stats: Stats,
 }
 
-// SAFETY: Wie beim io_uring-Transport — als Ganzes in genau einen Thread
-// verschoben, nie geteilt.
+// SAFETY: as with the io_uring transport — moved as a whole into exactly one
+// thread, never shared.
 unsafe impl Send for Usbfs {}
 
 impl Usbfs {
-    /// Übernimmt einen offenen usbfs-Deskriptor (z. B. aus `termux-usb`).
+    /// Takes an open usbfs descriptor, e.g. the one from `termux-usb`.
     pub fn new(fd: i32, ifno: i32) -> Result<Self> {
-        // Kernel-Treiber lösen, sonst verweigert CLAIMINTERFACE.
-        let mut req = UsbdevfsIoctl { ifno, ioctl_code: IOCTL_DISCONNECT, data: core::ptr::null_mut() };
+        // Detach the kernel driver, otherwise CLAIMINTERFACE refuses.
+        let mut req =
+            UsbdevfsIoctl { ifno, ioctl_code: IOCTL_DISCONNECT, data: core::ptr::null_mut() };
         let reattach =
             sys::ioctl(fd, usbdevfs_ioctl(), &mut req as *mut UsbdevfsIoctl as usize).is_ok();
 
@@ -191,7 +196,7 @@ impl Usbfs {
         Ok(u)
     }
 
-    /// Reiht den Lese-URB für Puffer `idx` ein.
+    /// Queues the read URB for buffer `idx`.
     #[inline]
     fn submit(&mut self, idx: usize) -> Result<()> {
         let buf = self.bufs[idx].as_mut_ptr();
@@ -206,7 +211,7 @@ impl Usbfs {
         Ok(())
     }
 
-    /// Erntet einen fertigen URB, ohne zu blockieren.
+    /// Collects one finished URB without blocking.
     #[inline]
     fn reap(&mut self) -> Result<Option<*mut Urb>> {
         let mut ptr: usize = 0;
@@ -215,7 +220,7 @@ impl Usbfs {
                 self.stats.reaps += 1;
                 Ok(Some(ptr as *mut Urb))
             }
-            // EAGAIN: gerade nichts fertig.
+            // EAGAIN: nothing finished right now.
             Err(e) if e.raw_os_error() == Some(11) => Ok(None),
             Err(e) => Err(Error::Io(e)),
         }
@@ -243,7 +248,7 @@ impl Drop for Usbfs {
 
 impl Transport for Usbfs {
     fn send(&mut self, frame: &[u8]) -> Result<()> {
-        // Auf dem Draht steht der Frame ohne hidraw-Report-ID.
+        // On the wire the frame goes out without a hidraw report-ID byte.
         self.out_buf[..frame.len()].copy_from_slice(frame);
         let ptr = self.out_buf.as_mut_ptr();
         self.out_urb.buffer = ptr;
@@ -262,10 +267,11 @@ impl Transport for Usbfs {
             while let Some(p) = self.reap()? {
                 batch += 1;
                 self.stats.max_batch = self.stats.max_batch.max(batch);
-                // SAFETY: Der Zeiger stammt aus unserem eigenen URB-Array.
-                let (ctx, len, status) = unsafe { ((*p).usercontext as usize, (*p).actual_length, (*p).status) };
+                // SAFETY: the pointer comes out of our own URB array.
+                let (ctx, len, status) =
+                    unsafe { ((*p).usercontext as usize, (*p).actual_length, (*p).status) };
                 if ctx == usize::MAX {
-                    self.out_pending = false; // Schreib-URB, nichts zu liefern
+                    self.out_pending = false; // write URB, nothing to deliver
                     continue;
                 }
                 let idx = ctx;
@@ -281,7 +287,7 @@ impl Transport for Usbfs {
                 return Ok(0);
             }
             self.stats.waits += 1;
-            // usbfs signalisiert fertige URBs als POLLOUT.
+            // usbfs signals finished URBs as POLLOUT.
             if !sys::wait_events(self.fd, sys::POLLOUT, timeout_ns).map_err(Error::Io)? {
                 return Ok(0);
             }

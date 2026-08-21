@@ -1,17 +1,16 @@
-//! Blockierender `hidraw`-Transport — der Fallback dort, wo io_uring nicht
-//! erlaubt ist (Android-App-Sandbox sperrt `io_uring_setup` per seccomp).
+//! Blocking `hidraw` transport — the fallback wherever io_uring is not allowed.
 //!
-//! Gewartet wird mit `ppoll`, nicht mit einer Schleife: zwei Syscalls pro
-//! Ereignis, dazwischen schläft der Thread im Kernel. `hidraw` hält selbst
-//! einen Ringpuffer über mehrere Reports, es geht also nichts verloren,
-//! solange der Verbraucher im Mittel Schritt hält.
+//! Waiting is done with `ppoll`, not with a loop: two syscalls per event, and
+//! the thread sleeps in the kernel in between. `hidraw` keeps a ring of several
+//! reports itself, so nothing is lost as long as the consumer keeps up on
+//! average.
 
 use std::io::ErrorKind;
 
 use crate::sys;
 use crate::{Error, Result, Transport, FRAME_MAX};
 
-/// Öffnet einen hidraw-Knoten und liefert den rohen Deskriptor.
+/// Opens a hidraw node and returns the raw descriptor.
 pub fn open_fd(path: &str) -> Result<i32> {
     use std::fs::OpenOptions;
     use std::os::fd::IntoRawFd;
@@ -19,7 +18,7 @@ pub fn open_fd(path: &str) -> Result<i32> {
     Ok(file.into_raw_fd())
 }
 
-/// Sucht den hidraw-Knoten zur gesuchten VID:PID.
+/// Finds the hidraw node matching the given VID:PID.
 pub fn find_fd(vid: u16, pid: u16) -> Result<i32> {
     let needle = format!("{vid:08X}:{pid:08X}");
     for entry in std::fs::read_dir("/sys/class/hidraw")? {
@@ -33,18 +32,18 @@ pub fn find_fd(vid: u16, pid: u16) -> Result<i32> {
     }
     Err(Error::Io(std::io::Error::new(
         ErrorKind::NotFound,
-        "kein hidraw-Knoten mit passender VID:PID",
+        "no hidraw node with matching VID:PID",
     )))
 }
 
 pub struct Hidraw {
     fd: i32,
-    /// Syscall-Zähler, um gegen den io_uring-Pfad vergleichen zu können.
+    /// Syscall counter, so this path can be compared against io_uring.
     pub syscalls: u64,
 }
 
 impl Hidraw {
-    /// Übernimmt den Deskriptor; schließt ihn beim Verwerfen.
+    /// Takes ownership of the descriptor and closes it on drop.
     pub fn new(fd: i32) -> Self {
         Hidraw { fd, syscalls: 0 }
     }
@@ -63,8 +62,8 @@ impl Drop for Hidraw {
 impl Transport for Hidraw {
     #[inline]
     fn send(&mut self, frame: &[u8]) -> Result<()> {
-        // hidraw erwartet ein führendes Report-ID-Byte; das Gerät benutzt keine
-        // nummerierten Reports, also 0.
+        // hidraw expects a leading report-ID byte; this device does not use
+        // numbered reports, so it is zero.
         let mut buf = [0u8; FRAME_MAX + 1];
         buf[1..1 + frame.len()].copy_from_slice(frame);
         self.syscalls += 1;

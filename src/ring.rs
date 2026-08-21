@@ -1,18 +1,19 @@
-//! Sperrfreier SPSC-Ringpuffer — dasselbe Prinzip wie die io_uring-Queues,
-//! nur zwischen zwei Threads im eigenen Adressraum.
+//! Lock-free SPSC ring buffer — the same idea as the io_uring queues, but
+//! between two threads inside one address space.
 //!
-//! Ein Erzeuger (der Lese-Thread), ein Verbraucher (Renderer, Fusion, Eingabe).
-//! Kein Mutex, kein Syscall, keine Allokation im Betrieb. Head und Tail liegen
-//! auf getrennten Cache-Zeilen, damit sich die beiden Threads nicht gegenseitig
-//! die Zeile aus dem Cache reißen.
+//! One producer (the reader thread), one consumer (renderer, fusion, input).
+//! No mutex, no syscall, no allocation while running. Head and tail sit on
+//! separate cache lines so the two threads do not steal the line from each
+//! other.
 //!
-//! Kapazität ist eine Zweierpotenz, damit die Maskierung ohne Division läuft.
+//! Capacity is a power of two so masking replaces division.
 //!
-//! Überlauf verwirft den **neuesten** Wert und zählt ihn. Das ist bewusst so:
-//! Nur der Verbraucher darf `tail` schreiben, sonst gäbe es zwei Schreiber auf
-//! demselben Index und damit ein Datenrennen. Wer keinen Rückstand will, holt
-//! mit [`Ring::take_latest`] ab — dann läuft der Ring gar nicht erst voll.
-//! Blockiert wird nie: der Lese-Thread darf niemals auf den Verbraucher warten.
+//! On overflow the **newest** value is dropped and counted. That is
+//! deliberate: only the consumer may write `tail`, otherwise there would be two
+//! writers on the same index and therefore a data race. Anyone who does not
+//! want a backlog should use [`Ring::take_latest`] — then the ring never fills
+//! up in the first place. Nothing ever blocks: the reader thread must never
+//! wait on the consumer.
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
@@ -21,19 +22,19 @@ use core::sync::atomic::{AtomicU64, Ordering};
 #[repr(align(64))]
 struct CacheLine<T>(T);
 
-/// Ringpuffer fester Kapazität für `Copy`-Nutzlasten.
+/// Fixed-capacity ring buffer for `Copy` payloads.
 pub struct Ring<T: Copy, const N: usize> {
     slots: UnsafeCell<[MaybeUninit<T>; N]>,
-    /// Vom Erzeuger geschrieben, vom Verbraucher gelesen.
+    /// Written by the producer, read by the consumer.
     head: CacheLine<AtomicU64>,
-    /// Vom Verbraucher geschrieben, vom Erzeuger gelesen.
+    /// Written by the consumer, read by the producer.
     tail: CacheLine<AtomicU64>,
-    /// Wie oft der Erzeuger den Verbraucher überholt hat.
+    /// How often the producer had to drop a value.
     dropped: CacheLine<AtomicU64>,
 }
 
-// SAFETY: Zugriff ist durch die Indizes diszipliniert; genau ein Erzeuger und
-// genau ein Verbraucher (SPSC).
+// SAFETY: access is disciplined by the indices; exactly one producer and
+// exactly one consumer (SPSC).
 unsafe impl<T: Copy + Send, const N: usize> Send for Ring<T, N> {}
 unsafe impl<T: Copy + Send, const N: usize> Sync for Ring<T, N> {}
 
@@ -41,7 +42,7 @@ impl<T: Copy, const N: usize> Ring<T, N> {
     const MASK: u64 = (N as u64) - 1;
 
     pub const fn new() -> Self {
-        assert!(N.is_power_of_two(), "Kapazität muss eine Zweierpotenz sein");
+        assert!(N.is_power_of_two(), "capacity must be a power of two");
         Ring {
             slots: UnsafeCell::new([MaybeUninit::uninit(); N]),
             head: CacheLine(AtomicU64::new(0)),
@@ -50,8 +51,8 @@ impl<T: Copy, const N: usize> Ring<T, N> {
         }
     }
 
-    /// Erzeugerseite. `false`, wenn der Ring voll war und der Wert verworfen
-    /// wurde. Wartet nie.
+    /// Producer side. Returns `false` if the ring was full and the value was
+    /// dropped. Never waits.
     #[inline]
     pub fn push(&self, value: T) -> bool {
         let head = self.head.0.load(Ordering::Relaxed);
@@ -60,8 +61,8 @@ impl<T: Copy, const N: usize> Ring<T, N> {
             self.dropped.0.fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        // SAFETY: Nur der Erzeuger schreibt, und nur in den Slot bei head, der
-        // wegen der Füllstandsprüfung gerade nicht vom Verbraucher gelesen wird.
+        // SAFETY: only the producer writes, and only into the slot at head,
+        // which the fill check just proved the consumer is not reading.
         unsafe {
             let slots = &mut *self.slots.get();
             slots[(head & Self::MASK) as usize] = MaybeUninit::new(value);
@@ -70,7 +71,7 @@ impl<T: Copy, const N: usize> Ring<T, N> {
         true
     }
 
-    /// Verbraucherseite, ein Element.
+    /// Consumer side, one element.
     #[inline]
     pub fn pop(&self) -> Option<T> {
         let tail = self.tail.0.load(Ordering::Relaxed);
@@ -78,7 +79,7 @@ impl<T: Copy, const N: usize> Ring<T, N> {
         if tail == head {
             return None;
         }
-        // SAFETY: Slot wurde vom Erzeuger vor dem Release-Store beschrieben.
+        // SAFETY: the producer wrote the slot before its release store.
         let value = unsafe {
             let slots = &*self.slots.get();
             slots[(tail & Self::MASK) as usize].assume_init()
@@ -87,8 +88,8 @@ impl<T: Copy, const N: usize> Ring<T, N> {
         Some(value)
     }
 
-    /// Verbraucherseite, alles auf einmal — der Batch-Zug aus io_uring:
-    /// ein Acquire, dann n Elemente, dann ein Release.
+    /// Consumer side, everything at once — the batching move from io_uring:
+    /// one acquire, then n elements, then one release.
     #[inline]
     pub fn drain(&self, mut f: impl FnMut(T)) -> usize {
         let mut tail = self.tail.0.load(Ordering::Relaxed);
@@ -97,7 +98,7 @@ impl<T: Copy, const N: usize> Ring<T, N> {
         if n == 0 {
             return 0;
         }
-        // SAFETY: siehe pop().
+        // SAFETY: see pop().
         let slots = unsafe { &*self.slots.get() };
         for _ in 0..n {
             f(unsafe { slots[(tail & Self::MASK) as usize].assume_init() });
@@ -107,8 +108,8 @@ impl<T: Copy, const N: usize> Ring<T, N> {
         n as usize
     }
 
-    /// Nur der jüngste Eintrag; der Rest wird verworfen. Für Lagedaten, bei
-    /// denen ein Renderer ohnehin nur den aktuellen Wert braucht.
+    /// Only the newest entry; the rest is discarded. For renderers that care
+    /// about the current value and nothing else.
     #[inline]
     pub fn take_latest(&self) -> Option<T> {
         let head = self.head.0.load(Ordering::Acquire);
@@ -116,7 +117,7 @@ impl<T: Copy, const N: usize> Ring<T, N> {
         if head == tail {
             return None;
         }
-        // SAFETY: siehe pop().
+        // SAFETY: see pop().
         let value = unsafe {
             let slots = &*self.slots.get();
             slots[((head - 1) & Self::MASK) as usize].assume_init()
@@ -137,7 +138,7 @@ impl<T: Copy, const N: usize> Ring<T, N> {
         self.len() == 0
     }
 
-    /// Wie viele Einträge der Erzeuger verworfen hat, weil niemand abgeholt hat.
+    /// How many entries the producer had to drop because nobody collected.
     #[inline]
     pub fn dropped(&self) -> u64 {
         self.dropped.0.load(Ordering::Relaxed)
@@ -155,7 +156,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fifo_reihenfolge() {
+    fn preserves_fifo_order() {
         let r: Ring<u32, 8> = Ring::new();
         for i in 0..5 {
             r.push(i);
@@ -167,10 +168,10 @@ mod tests {
     }
 
     #[test]
-    fn ueberlauf_verwirft_neueste_und_zaehlt() {
+    fn overflow_drops_newest_and_counts() {
         let r: Ring<u32, 4> = Ring::new();
-        let angenommen = (0..6).filter(|&i| r.push(i)).count();
-        assert_eq!(angenommen, 4);
+        let accepted = (0..6).filter(|&i| r.push(i)).count();
+        assert_eq!(accepted, 4);
         assert_eq!(r.dropped(), 2);
         let mut out = Vec::new();
         r.drain(|v| out.push(v));
@@ -178,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn jüngster_eintrag() {
+    fn take_latest_skips_backlog() {
         let r: Ring<u32, 8> = Ring::new();
         for i in 0..5 {
             r.push(i);
@@ -187,52 +188,52 @@ mod tests {
         assert!(r.is_empty());
     }
 
-    /// Erzeuger und Verbraucher gleichzeitig: Reihenfolge muss streng steigen,
-    /// und alles muss entweder angekommen oder gezählt verworfen sein.
+    /// Producer and consumer running concurrently: order must be strictly
+    /// increasing, and everything must either arrive or be counted as dropped.
     #[test]
-    fn spsc_reihenfolge_und_bilanz() {
+    fn spsc_order_and_accounting() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
         const N: u64 = 200_000;
         let r: Arc<Ring<u64, 1024>> = Arc::new(Ring::new());
-        let fertig = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
 
-        let prod = {
+        let producer = {
             let r = Arc::clone(&r);
-            let fertig = Arc::clone(&fertig);
+            let done = Arc::clone(&done);
             std::thread::spawn(move || {
-                let mut angenommen = 0u64;
+                let mut accepted = 0u64;
                 for i in 0..N {
                     if r.push(i) {
-                        angenommen += 1;
+                        accepted += 1;
                     }
                 }
-                fertig.store(true, Ordering::Release);
-                angenommen
+                done.store(true, Ordering::Release);
+                accepted
             })
         };
 
-        let mut geholt = 0u64;
+        let mut collected = 0u64;
         let mut last: Option<u64> = None;
         loop {
             let n = r.drain(|v| {
                 if let Some(l) = last {
-                    assert!(v > l, "Reihenfolge verletzt: {l} -> {v}");
+                    assert!(v > l, "order violated: {l} -> {v}");
                 }
                 last = Some(v);
             });
-            geholt += n as u64;
+            collected += n as u64;
             if n == 0 {
-                if fertig.load(Ordering::Acquire) && r.is_empty() {
+                if done.load(Ordering::Acquire) && r.is_empty() {
                     break;
                 }
                 std::thread::yield_now();
             }
         }
 
-        let angenommen = prod.join().unwrap();
-        assert_eq!(geholt, angenommen, "alles Angenommene muss ankommen");
-        assert_eq!(angenommen + r.dropped(), N, "Bilanz muss aufgehen");
+        let accepted = producer.join().unwrap();
+        assert_eq!(collected, accepted, "everything accepted must arrive");
+        assert_eq!(accepted + r.dropped(), N, "accounting must balance");
     }
 }

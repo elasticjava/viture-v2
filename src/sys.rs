@@ -1,20 +1,21 @@
-//! Rohe Linux-Syscalls ohne `libc`.
+//! Raw Linux syscalls, no `libc`.
 //!
-//! Nur die Handvoll Aufrufe, die der Treiber braucht. Die Syscall-Nummern von
-//! `io_uring_*` sind auf x86_64 und aarch64 identisch (generischer Bereich),
-//! die klassischen unterscheiden sich.
+//! Only the handful of calls this driver needs. The `io_uring_*` numbers are
+//! identical on x86-64 and aarch64 (they live in the generic range); the
+//! classic ones differ.
 
 #![allow(dead_code)]
 
 use core::arch::asm;
 
-// ---- Syscall-Nummern -------------------------------------------------------
+// ---- Syscall numbers -------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
 mod nr {
     pub const READ: usize = 0;
     pub const WRITE: usize = 1;
     pub const CLOSE: usize = 3;
+    pub const IOCTL: usize = 16;
     pub const MMAP: usize = 9;
     pub const MUNMAP: usize = 11;
     pub const PPOLL: usize = 271;
@@ -25,17 +26,18 @@ mod nr {
     pub const READ: usize = 63;
     pub const WRITE: usize = 64;
     pub const CLOSE: usize = 57;
+    pub const IOCTL: usize = 29;
     pub const MMAP: usize = 222;
     pub const MUNMAP: usize = 215;
     pub const PPOLL: usize = 73;
 }
 
-/// Auf beiden Architekturen gleich.
+/// Same on both architectures.
 pub const NR_IO_URING_SETUP: usize = 425;
 pub const NR_IO_URING_ENTER: usize = 426;
 pub const NR_IO_URING_REGISTER: usize = 427;
 
-// ---- Syscall-Einsprung -----------------------------------------------------
+// ---- Syscall entry ---------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
@@ -91,7 +93,7 @@ unsafe fn syscall6(
     ret
 }
 
-/// Wandelt einen negativen Syscall-Rückgabewert in einen `io::Error`.
+/// Turns a negative syscall return value into an `io::Error`.
 #[inline]
 fn wrap(ret: isize) -> std::io::Result<usize> {
     if ret < 0 {
@@ -101,7 +103,7 @@ fn wrap(ret: isize) -> std::io::Result<usize> {
     }
 }
 
-// ---- Dünne Hüllen ----------------------------------------------------------
+// ---- Thin wrappers ---------------------------------------------------------
 
 pub const PROT_READ: usize = 1;
 pub const PROT_WRITE: usize = 2;
@@ -109,7 +111,13 @@ pub const MAP_SHARED: usize = 1;
 pub const MAP_POPULATE: usize = 0x8000;
 
 #[inline]
-pub unsafe fn mmap(len: usize, prot: usize, flags: usize, fd: i32, off: u64) -> std::io::Result<*mut u8> {
+pub unsafe fn mmap(
+    len: usize,
+    prot: usize,
+    flags: usize,
+    fd: i32,
+    off: u64,
+) -> std::io::Result<*mut u8> {
     let r = syscall6(nr::MMAP, 0, len, prot, flags, fd as usize, off as usize);
     if r < 0 {
         Err(std::io::Error::from_raw_os_error(-r as i32))
@@ -125,7 +133,9 @@ pub unsafe fn munmap(addr: *mut u8, len: usize) -> std::io::Result<()> {
 
 #[inline]
 pub fn read(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
-    unsafe { wrap(syscall6(nr::READ, fd as usize, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0)) }
+    unsafe {
+        wrap(syscall6(nr::READ, fd as usize, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0))
+    }
 }
 
 #[inline]
@@ -154,24 +164,24 @@ pub struct Timespec {
 }
 
 pub const POLLIN: i16 = 0x001;
-/// usbfs meldet fertige URBs als „beschreibbar".
+/// usbfs reports completed URBs as "writable".
 pub const POLLOUT: i16 = 0x004;
 
-/// Wartet auf Lesbarkeit. `timeout_ns == u64::MAX` wartet unbegrenzt.
-/// Liefert `true`, wenn Daten anliegen.
+/// Waits for readability. `timeout_ns == u64::MAX` waits forever.
 pub fn wait_readable(fd: i32, timeout_ns: u64) -> std::io::Result<bool> {
     wait_events(fd, POLLIN, timeout_ns)
 }
 
-/// Wartet auf beliebige Poll-Ereignisse.
+/// Waits for arbitrary poll events.
 pub fn wait_events(fd: i32, events: i16, timeout_ns: u64) -> std::io::Result<bool> {
     let mut pfd = PollFd { fd, events, revents: 0 };
-    let ts = Timespec { sec: (timeout_ns / 1_000_000_000) as i64, nsec: (timeout_ns % 1_000_000_000) as i64 };
+    let ts = Timespec {
+        sec: (timeout_ns / 1_000_000_000) as i64,
+        nsec: (timeout_ns % 1_000_000_000) as i64,
+    };
     let tsp = if timeout_ns == u64::MAX { 0 } else { &ts as *const Timespec as usize };
     loop {
-        let r = unsafe {
-            syscall6(nr::PPOLL, &mut pfd as *mut PollFd as usize, 1, tsp, 0, 8, 0)
-        };
+        let r = unsafe { syscall6(nr::PPOLL, &mut pfd as *mut PollFd as usize, 1, tsp, 0, 8, 0) };
         if r == -4 {
             continue; // EINTR
         }
@@ -179,15 +189,10 @@ pub fn wait_events(fd: i32, events: i16, timeout_ns: u64) -> std::io::Result<boo
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-const NR_IOCTL: usize = 16;
-#[cfg(target_arch = "aarch64")]
-const NR_IOCTL: usize = 29;
-
 #[inline]
 pub fn ioctl(fd: i32, request: usize, arg: usize) -> std::io::Result<usize> {
     loop {
-        let r = unsafe { syscall6(NR_IOCTL, fd as usize, request, arg, 0, 0, 0) };
+        let r = unsafe { syscall6(nr::IOCTL, fd as usize, request, arg, 0, 0, 0) };
         if r == -4 {
             continue; // EINTR
         }
@@ -195,7 +200,7 @@ pub fn ioctl(fd: i32, request: usize, arg: usize) -> std::io::Result<usize> {
     }
 }
 
-/// Baut eine `_IOC`-Nummer wie `linux/ioctl.h`.
+/// Builds an `_IOC` number the way `linux/ioctl.h` does.
 pub const fn ioc(dir: usize, typ: u8, nr: u8, size: usize) -> usize {
     (dir << 30) | (size << 16) | ((typ as usize) << 8) | (nr as usize)
 }
@@ -204,11 +209,72 @@ pub const IOC_NONE: usize = 0;
 pub const IOC_WRITE: usize = 1;
 pub const IOC_READ: usize = 2;
 
+// ---- Terminal --------------------------------------------------------------
+
+const TCGETS: usize = 0x5401;
+const TCSETS: usize = 0x5402;
+const TIOCGWINSZ: usize = 0x5413;
+
+const ICANON: u32 = 0o000002;
+const ECHO: u32 = 0o000010;
+const VTIME: usize = 5;
+const VMIN: usize = 6;
+
+/// The kernel's `struct termios` (asm-generic, `NCCS = 19`).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Termios {
+    pub c_iflag: u32,
+    pub c_oflag: u32,
+    pub c_cflag: u32,
+    pub c_lflag: u32,
+    pub c_line: u8,
+    pub c_cc: [u8; 19],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct WinSize {
+    pub rows: u16,
+    pub cols: u16,
+    pub xpixel: u16,
+    pub ypixel: u16,
+}
+
+pub fn tcgetattr(fd: i32) -> std::io::Result<Termios> {
+    let mut t = Termios::default();
+    ioctl(fd, TCGETS, &mut t as *mut Termios as usize)?;
+    Ok(t)
+}
+
+pub fn tcsetattr(fd: i32, t: &Termios) -> std::io::Result<()> {
+    ioctl(fd, TCSETS, t as *const Termios as usize).map(|_| ())
+}
+
+/// Switches the terminal to raw-ish mode: no line buffering, no echo, reads
+/// return immediately. Returns the previous settings for restoring later.
+pub fn enter_raw_mode(fd: i32) -> std::io::Result<Termios> {
+    let previous = tcgetattr(fd)?;
+    let mut raw = previous;
+    raw.c_lflag &= !(ICANON | ECHO);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(fd, &raw)?;
+    Ok(previous)
+}
+
+pub fn window_size(fd: i32) -> std::io::Result<WinSize> {
+    let mut w = WinSize::default();
+    ioctl(fd, TIOCGWINSZ, &mut w as *mut WinSize as usize)?;
+    Ok(w)
+}
+
 // ---- io_uring --------------------------------------------------------------
 
 #[inline]
 pub unsafe fn io_uring_setup(entries: u32, params: *mut u8) -> std::io::Result<i32> {
-    wrap(syscall6(NR_IO_URING_SETUP, entries as usize, params as usize, 0, 0, 0, 0)).map(|v| v as i32)
+    wrap(syscall6(NR_IO_URING_SETUP, entries as usize, params as usize, 0, 0, 0, 0))
+        .map(|v| v as i32)
 }
 
 #[inline]
@@ -221,8 +287,8 @@ pub unsafe fn io_uring_enter(
     io_uring_enter_arg(fd, to_submit, min_complete, flags, 0, 0)
 }
 
-/// Variante mit `IORING_ENTER_EXT_ARG`: `arg` zeigt auf `io_uring_getevents_arg`
-/// und trägt den Timeout, ohne dafür einen eigenen SQE zu verbrauchen.
+/// Variant using `IORING_ENTER_EXT_ARG`: `arg` points at an
+/// `io_uring_getevents_arg` carrying the timeout, so no SQE is spent on it.
 #[inline]
 pub unsafe fn io_uring_enter_arg(
     fd: i32,
@@ -243,8 +309,8 @@ pub unsafe fn io_uring_enter_arg(
             argsz,
         );
         match r {
-            -4 => continue,       // EINTR
-            -62 => return Ok(0),  // ETIME: Timeout, keine Completion
+            -4 => continue,      // EINTR
+            -62 => return Ok(0), // ETIME: timed out, nothing completed
             _ => return wrap(r),
         }
     }

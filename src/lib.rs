@@ -1,67 +1,68 @@
-//! VITURE Gen2 („Protokoll V2") über USB-HID — ohne Vendor-SDK.
+//! VITURE Gen2 ("protocol V2") over USB HID — without the vendor SDK.
 //!
-//! Ermittelt an VITURE Pro 2 XR (`35CA:1301`) durch Mitschnitt des offiziellen
-//! SDK gegen dessen eigene Frame-Protokollierung.
+//! Determined on a VITURE Pro 2 XR (`35CA:1301`) by capturing the official
+//! SDK's traffic and matching it against the SDK's own frame logging.
 //!
-//! Rahmen (little-endian):
+//! Frame layout (little-endian):
 //! ```text
-//! 0  u16  Präambel 0x0010
+//! 0  u16  preamble 0x0010
 //! 2  u16  MsgID
-//! 4  u16  PayloadLen
-//! 6  u16  Checksum = Bytesumme der Payload
-//! 8  ..   Payload
+//! 4  u16  payload length
+//! 6  u16  checksum = byte sum of the payload
+//! 8  ..   payload
 //! ```
-//! Antwort-MsgID = Anfrage-MsgID + [`RESPONSE_OFFSET`]. Antworten beginnen mit
-//! einem Statusbyte (0 = ok).
+//! The reply carries the request's MsgID plus [`RESPONSE_OFFSET`] and starts
+//! with a status byte (0 = success).
 //!
-//! Der Hot Path allokiert nicht: Frames liegen auf Stack-Puffern fester Größe,
-//! Ereignisse werden per `from_le_bytes` aus Slices gelesen.
+//! The hot path does not allocate: frames live on fixed-size stack buffers and
+//! events are read out of slices with `from_le_bytes`.
 
 use core::fmt;
 
 pub mod hidraw;
+pub mod pointer;
 pub mod ring;
 pub mod sys;
 pub mod usbfs;
 #[cfg(target_os = "linux")]
 pub mod uring;
 
-/// Feste Report-Größe des Geräts.
+/// Fixed report size of the device.
 pub const FRAME_MAX: usize = 64;
-/// Kopfgröße vor der Payload.
+/// Header size preceding the payload.
 pub const HEADER_LEN: usize = 8;
-/// Konstante Präambel jedes Frames.
+/// Constant preamble of every frame.
 pub const PREAMBLE: u16 = 0x0010;
-/// Antwort-MsgID = Anfrage + dieser Wert.
+/// Reply MsgID = request MsgID plus this offset.
 pub const RESPONSE_OFFSET: u16 = 0x2000;
 
-/// Bekannte Nachrichten-IDs.
+/// Known message IDs.
 pub mod msg {
-    /// IMU-Steuerung, Payload `[streams, rate]`.
+    /// IMU control, payload `[streams, rate]`.
     pub const IMU_CTRL: u16 = 0x0301;
-    /// Seriennummer (Klartext-ASCII).
+    /// Serial number (plaintext ASCII).
     pub const SERIAL: u16 = 0x3002;
-    /// Firmware-Version (ASCII).
+    /// Firmware version (ASCII).
     pub const VERSION: u16 = 0x3003;
-    /// Helligkeitsstufe.
+    /// Brightness level.
     pub const BRIGHTNESS: u16 = 0x3122;
-    /// Duty-Cycle der Anzeige in Prozent.
+    /// Display duty cycle in percent.
     pub const DUTY_CYCLE: u16 = 0x3125;
-    /// Anzeigemodus, siehe [`super::DisplayMode`].
+    /// Display mode, see [`super::DisplayMode`].
     pub const DISPLAY_MODE: u16 = 0x3141;
-    /// Lautstärkestufe.
+    /// Volume level.
     pub const VOLUME: u16 = 0x3201;
-    /// Trage-Status, 0 = nicht getragen.
+    /// Wear status, 0 = not worn.
     pub const WEAR_STATUS: u16 = 0x3321;
 
-    /// Ereignis: fusionierte Lage (Quaternion).
+    /// Event: fused orientation (quaternion).
     pub const EVT_POSE: u16 = 0x7308;
-    /// Ereignis: Rohdaten (Gyro + Beschleunigung).
+    /// Event: raw data (gyroscope + accelerometer).
     pub const EVT_RAW: u16 = 0x7309;
 }
 
-/// Welche IMU-Ströme laufen sollen. Bitmaske auf dem Draht — Achtung, das
-/// SDK-Header-Enum benutzt andere Werte (`RAW = 0`, `POSE = 1`).
+/// Which IMU streams should run. This is a bitmask on the wire — note that the
+/// SDK header enum uses different values (`RAW = 0`, `POSE = 1`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Streams(pub u8);
 
@@ -76,7 +77,7 @@ impl Streams {
     }
 }
 
-/// Meldefrequenz. Die Pro 2 unterstützt Roh bis 1000 Hz, Pose nur bis 240 Hz.
+/// Reporting rate. The Pro 2 supports raw up to 1000 Hz, pose only to 240 Hz.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Rate {
@@ -88,7 +89,7 @@ pub enum Rate {
     Hz1000 = 5,
 }
 
-/// Anzeigemodi laut SDK-Header, bestätigt durch `0x3141`.
+/// Display modes from the SDK header, confirmed through `0x3141`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DisplayMode {
     P1080_60 = 0x31,
@@ -116,27 +117,27 @@ impl DisplayMode {
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
-    /// Frame war kürzer als der Kopf oder hatte die falsche Präambel.
+    /// Frame was shorter than the header or carried the wrong preamble.
     Malformed,
-    /// Checksumme stimmte nicht.
+    /// Checksum did not match.
     Checksum,
-    /// Gerät meldete ein Statusbyte ungleich null.
+    /// Device reported a non-zero status byte.
     Status(u8),
-    /// Innerhalb des Zeitfensters kam keine passende Antwort.
+    /// No matching reply arrived within the time window.
     Timeout,
-    /// Payload passte nicht in den Zielpuffer.
+    /// Payload did not fit the destination buffer.
     Overflow,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Io(e) => write!(f, "E/A: {e}"),
-            Error::Malformed => f.write_str("ungültiger Rahmen"),
-            Error::Checksum => f.write_str("Checksumme falsch"),
-            Error::Status(s) => write!(f, "Gerät meldet Status {s}"),
-            Error::Timeout => f.write_str("Zeitüberschreitung"),
-            Error::Overflow => f.write_str("Payload zu groß für Puffer"),
+            Error::Io(e) => write!(f, "I/O: {e}"),
+            Error::Malformed => f.write_str("malformed frame"),
+            Error::Checksum => f.write_str("checksum mismatch"),
+            Error::Status(s) => write!(f, "device reports status {s}"),
+            Error::Timeout => f.write_str("timed out"),
+            Error::Overflow => f.write_str("payload too large for buffer"),
         }
     }
 }
@@ -151,7 +152,7 @@ impl From<std::io::Error> for Error {
 
 pub type Result<T> = core::result::Result<T, Error>;
 
-/// Baut einen Frame in `buf` und liefert den belegten Teil zurück.
+/// Builds a frame into `buf` and returns the part that was filled.
 #[inline]
 pub fn build<'a>(buf: &'a mut [u8; FRAME_MAX], msg_id: u16, payload: &[u8]) -> Result<&'a [u8]> {
     let end = HEADER_LEN + payload.len();
@@ -167,14 +168,14 @@ pub fn build<'a>(buf: &'a mut [u8; FRAME_MAX], msg_id: u16, payload: &[u8]) -> R
     Ok(&buf[..end])
 }
 
-/// Ein empfangener Frame; borgt aus dem Empfangspuffer.
+/// A received frame; borrows from the receive buffer.
 #[derive(Clone, Copy)]
 pub struct Frame<'a> {
     pub msg_id: u16,
     pub payload: &'a [u8],
 }
 
-/// Zerlegt einen empfangenen Report. Prüft Präambel, Länge und Checksumme.
+/// Splits a received report apart, checking preamble, length and checksum.
 #[inline]
 pub fn parse(buf: &[u8]) -> Result<Frame<'_>> {
     if buf.len() < HEADER_LEN {
@@ -199,7 +200,7 @@ pub fn parse(buf: &[u8]) -> Result<Frame<'_>> {
     Ok(Frame { msg_id, payload })
 }
 
-/// Fusionierte Lage. `tick` zählt geräteintern, `q` ist `[w, x, y, z]`.
+/// Fused orientation. `tick` counts inside the device, `q` is `[w, x, y, z]`.
 #[derive(Clone, Copy, Debug)]
 pub struct Pose {
     pub tick: u32,
@@ -207,7 +208,7 @@ pub struct Pose {
 }
 
 impl Pose {
-    /// Payload von [`msg::EVT_POSE`]: `u32 unbekannt, u32 tick, 4× f32`.
+    /// Payload of [`msg::EVT_POSE`]: `u32 unknown, u32 tick, 4x f32`.
     #[inline]
     pub fn parse(p: &[u8]) -> Result<Pose> {
         if p.len() < 24 {
@@ -219,7 +220,7 @@ impl Pose {
         })
     }
 
-    /// Roll/Pitch/Yaw in Grad (ZYX).
+    /// Roll/pitch/yaw in degrees (ZYX convention).
     #[inline]
     pub fn euler_deg(&self) -> [f32; 3] {
         let [w, x, y, z] = self.q;
@@ -228,9 +229,33 @@ impl Pose {
         let yaw = (2.0 * (w * z + x * y)).atan2(1.0 - 2.0 * (y * y + z * z));
         [roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees()]
     }
+
+    /// Orientation relative to a reference pose, i.e. how far the head has
+    /// turned since the last recentre.
+    #[inline]
+    pub fn relative_to(&self, reference: &Pose) -> Pose {
+        Pose { tick: self.tick, q: quat_mul(quat_conj(reference.q), self.q) }
+    }
 }
 
-/// Rohdaten der IMU. Gyro in rad/s, Beschleunigung in g.
+/// Quaternion conjugate.
+#[inline]
+pub fn quat_conj(q: [f32; 4]) -> [f32; 4] {
+    [q[0], -q[1], -q[2], -q[3]]
+}
+
+/// Hamilton product, `[w, x, y, z]` order.
+#[inline]
+pub fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [
+        a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3],
+        a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2],
+        a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1],
+        a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0],
+    ]
+}
+
+/// Raw IMU data. Gyroscope in rad/s, acceleration in g.
 #[derive(Clone, Copy, Debug)]
 pub struct Raw {
     pub tick: u32,
@@ -239,8 +264,8 @@ pub struct Raw {
 }
 
 impl Raw {
-    /// Payload von [`msg::EVT_RAW`]: wie Pose, aber mit u16 vor den Floats,
-    /// daher Versatz 10 statt 8.
+    /// Payload of [`msg::EVT_RAW`]: like pose, but with a u16 before the
+    /// floats, hence offset 10 instead of 8.
     #[inline]
     pub fn parse(p: &[u8]) -> Result<Raw> {
         if p.len() < 34 {
@@ -259,30 +284,29 @@ fn f32_at(p: &[u8], off: usize) -> f32 {
     f32::from_le_bytes([p[off], p[off + 1], p[off + 2], p[off + 3]])
 }
 
-/// Ein empfangenes Ereignis, sofern es eines der bekannten ist.
+/// A received event, if it is one of the known kinds.
 #[derive(Clone, Copy, Debug)]
 pub enum Event {
     Pose(Pose),
     Raw(Raw),
-    /// Alles andere — MsgID zur weiteren Kartierung.
+    /// Anything else — the MsgID is kept for further mapping.
     Other(u16),
 }
 
-/// Transport für 64-Byte-Reports.
+/// Transport for 64-byte reports.
 ///
-/// `recv` **wartet** bis zu `timeout_ns` im Kernel — es wird nirgends gepollt
-/// und nirgends geschlafen. `0` heißt „nur abholen, was schon da ist",
-/// [`u64::MAX`] heißt „unbegrenzt warten". Rückgabe `0` bedeutet
-/// Zeitüberschreitung.
+/// `recv` **waits** up to `timeout_ns` inside the kernel — nothing is polled
+/// and nothing sleeps. `0` means "collect whatever is already there",
+/// [`u64::MAX`] means "wait indefinitely". A return of `0` means timeout.
 pub trait Transport {
     fn send(&mut self, frame: &[u8]) -> Result<()>;
     fn recv(&mut self, buf: &mut [u8; FRAME_MAX], timeout_ns: u64) -> Result<usize>;
 }
 
-/// Vorgabe für Antworten auf Kommandos.
+/// Default patience for command replies.
 pub const REPLY_TIMEOUT_NS: u64 = 250_000_000;
 
-/// Gerät auf einem beliebigen Transport.
+/// A device on top of any transport.
 pub struct Device<T: Transport> {
     transport: T,
     rx: [u8; FRAME_MAX],
@@ -298,10 +322,10 @@ impl<T: Transport> Device<T> {
         &mut self.transport
     }
 
-    /// Sendet einen Frame und wartet auf die zugehörige Antwort. IMU-Ereignisse,
-    /// die zwischendurch eintreffen, werden übersprungen.
+    /// Sends a frame and waits for its reply. IMU events arriving in between
+    /// are skipped.
     ///
-    /// Gibt die Payload **ohne** das führende Statusbyte in `out` zurück.
+    /// Writes the payload **without** the leading status byte into `out`.
     pub fn request(
         &mut self,
         msg_id: u16,
@@ -321,7 +345,7 @@ impl<T: Transport> Device<T> {
             }
             let n = self.transport.recv(&mut self.rx, left)?;
             if n == 0 {
-                continue; // Zeitscheibe abgelaufen, Restzeit oben neu berechnet
+                continue; // slice expired, remaining time recomputed above
             }
             let f = match parse(&self.rx[..n]) {
                 Ok(f) => f,
@@ -342,7 +366,7 @@ impl<T: Transport> Device<T> {
         }
     }
 
-    /// Getter, dessen Antwort aus genau einem Wertbyte besteht.
+    /// Query whose reply is a single value byte.
     pub fn get_u8(&mut self, msg_id: u16) -> Result<u8> {
         let mut out = [0u8; 4];
         let n = self.request(msg_id, &[], &mut out, REPLY_TIMEOUT_NS)?;
@@ -352,7 +376,7 @@ impl<T: Transport> Device<T> {
         Ok(out[n - 1])
     }
 
-    /// Getter, dessen Antwort ASCII ist (Version, Seriennummer).
+    /// Query whose reply is ASCII (version, serial number).
     pub fn get_ascii<'b>(&mut self, msg_id: u16, out: &'b mut [u8]) -> Result<&'b str> {
         let n = self.request(msg_id, &[], out, REPLY_TIMEOUT_NS)?;
         let s = &out[..n];
@@ -380,8 +404,8 @@ impl<T: Transport> Device<T> {
         self.get_u8(msg::DUTY_CYCLE)
     }
 
-    /// `true`, wenn die Brille getragen wird. Liefert auch dann einen Wert,
-    /// wenn das Vendor-SDK den Ausgabeparameter nicht befüllt.
+    /// `true` if the glasses are being worn. Returns a value even where the
+    /// vendor SDK leaves its output parameter untouched.
     pub fn worn(&mut self) -> Result<bool> {
         Ok(self.get_u8(msg::WEAR_STATUS)? != 0)
     }
@@ -390,15 +414,15 @@ impl<T: Transport> Device<T> {
         Ok(DisplayMode::from_raw(self.get_u8(msg::DISPLAY_MODE)?))
     }
 
-    /// Startet oder stoppt die IMU-Ströme. Ein einziges Kommando, kein Handshake.
+    /// Starts or stops the IMU streams. One command, no handshake.
     pub fn set_imu(&mut self, streams: Streams, rate: Rate) -> Result<()> {
         let mut out = [0u8; 4];
         self.request(msg::IMU_CTRL, &[streams.0, rate as u8], &mut out, REPLY_TIMEOUT_NS)?;
         Ok(())
     }
 
-    /// Wartet bis zu `timeout_ns` auf das nächste Ereignis. `Ok(None)` heißt
-    /// Zeitüberschreitung — gewartet wird im Kernel, nicht in einer Schleife.
+    /// Waits up to `timeout_ns` for the next event. `Ok(None)` means timeout —
+    /// the waiting happens in the kernel, not in a loop.
     #[inline]
     pub fn next_event(&mut self, timeout_ns: u64) -> Result<Option<Event>> {
         let n = self.transport.recv(&mut self.rx, timeout_ns)?;
@@ -418,23 +442,23 @@ impl<T: Transport> Device<T> {
 mod tests {
     use super::*;
 
-    /// Gegen den echten Mitschnitt: open_imu(POSE, 120 Hz).
+    /// Against the real capture: open_imu(POSE, 120 Hz).
     #[test]
-    fn baut_imu_kommando_wie_das_sdk() {
+    fn builds_imu_command_like_the_sdk() {
         let mut buf = [0u8; FRAME_MAX];
         let f = build(&mut buf, msg::IMU_CTRL, &[Streams::POSE.0, Rate::Hz120 as u8]).unwrap();
         assert_eq!(f, &[0x10, 0x00, 0x01, 0x03, 0x02, 0x00, 0x03, 0x00, 0x01, 0x02]);
     }
 
     #[test]
-    fn baut_getter_ohne_payload() {
+    fn builds_query_without_payload() {
         let mut buf = [0u8; FRAME_MAX];
         let f = build(&mut buf, msg::BRIGHTNESS, &[]).unwrap();
         assert_eq!(f, &[0x10, 0x00, 0x22, 0x31, 0x00, 0x00, 0x00, 0x00]);
     }
 
     #[test]
-    fn zerlegt_helligkeitsantwort() {
+    fn parses_brightness_reply() {
         let bytes = [0x10, 0x00, 0x22, 0x51, 0x02, 0x00, 0x03, 0x00, 0x00, 0x03];
         let f = parse(&bytes).unwrap();
         assert_eq!(f.msg_id, msg::BRIGHTNESS + RESPONSE_OFFSET);
@@ -442,14 +466,14 @@ mod tests {
     }
 
     #[test]
-    fn erkennt_falsche_checksumme() {
+    fn rejects_bad_checksum() {
         let bytes = [0x10, 0x00, 0x22, 0x51, 0x02, 0x00, 0xFF, 0x00, 0x00, 0x03];
         assert!(matches!(parse(&bytes), Err(Error::Checksum)));
     }
 
-    /// Pose-Paket aus dem Mitschnitt; Quaternion muss normiert sein.
+    /// Pose packet from the capture; the quaternion must be normalised.
     #[test]
-    fn zerlegt_pose_ereignis() {
+    fn parses_pose_event() {
         let mut bytes = vec![0x10, 0x00, 0x08, 0x73, 0x18, 0x00, 0x00, 0x00];
         let payload: [u8; 24] = [
             0x26, 0x01, 0x00, 0x00, 0x59, 0xd6, 0x21, 0x00, 0xdd, 0xe3, 0x2b, 0x3e, 0x52, 0x5d,
@@ -464,5 +488,16 @@ mod tests {
         assert_eq!(pose.tick, 0x0021_d659);
         let n = pose.q.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((n - 1.0).abs() < 1e-3, "|q| = {n}");
+    }
+
+    /// Relative orientation against itself must be the identity rotation.
+    #[test]
+    fn relative_to_self_is_identity() {
+        let p = Pose { tick: 0, q: [0.1153, 0.9922, -0.0417, -0.0051] };
+        let r = p.relative_to(&p);
+        assert!((r.q[0] - 1.0).abs() < 1e-3, "w = {}", r.q[0]);
+        for c in &r.q[1..] {
+            assert!(c.abs() < 1e-3, "axis component {c}");
+        }
     }
 }
