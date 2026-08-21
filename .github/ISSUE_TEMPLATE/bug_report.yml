@@ -1,0 +1,35 @@
+name: Bug report
+description: Something behaves differently than documented
+labels: [bug]
+body:
+  - type: input
+    id: device
+    attributes:
+      label: Glasses
+      description: Model and USB product id, e.g. "Pro 2 XR, 35CA:1301"
+      placeholder: "Pro 2 XR, 35CA:1301"
+    validations: { required: true }
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware
+      description: Output of `viture-v2 info`
+    validations: { required: false }
+  - type: dropdown
+    id: host
+    attributes:
+      label: Host
+      options: [Linux x86-64, Linux aarch64, Android / Termux, Android app via JNI, other]
+    validations: { required: true }
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport
+      options: [io_uring, usbfs, hidraw, unknown]
+    validations: { required: true }
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Expected against observed. Paste the output of `viture-v2 probe` if the device is not found.
+    validations: { required: true }

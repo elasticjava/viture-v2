@@ -1,0 +1,21 @@
+name: Protocol finding
+description: A message id, payload field or device behaviour that PROTOCOL.md does not cover yet
+labels: [protocol]
+body:
+  - type: input
+    id: msgid
+    attributes:
+      label: Message id
+      placeholder: "0x31xx"
+  - type: textarea
+    id: capture
+    attributes:
+      label: Evidence
+      description: Raw frames, ideally captured against the SDK's own log line so the id is labelled.
+      render: text
+    validations: { required: true }
+  - type: input
+    id: device
+    attributes:
+      label: Device it was seen on
+    validations: { required: true }
