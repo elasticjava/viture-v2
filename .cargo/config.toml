@@ -1,4 +1,13 @@
 # The Android linker is supplied by the build environment via
 # CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER so this file stays portable.
+
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
+
+[target.aarch64-linux-android]
+# Without an explicit soname the shared object carries none, and anything
+# linking it records the absolute build path as its dependency instead of the
+# library name. On the device that path does not exist and dlopen fails with
+# "library ... not found". Setting the soname makes the dependency resolve by
+# name out of the APK's lib directory.
+rustflags = ["-C", "link-arg=-Wl,-soname,libviture_v2.so"]
