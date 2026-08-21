@@ -1,5 +1,10 @@
 # viture-v2
 
+[![CI](https://github.com/elasticjava/viture-v2/actions/workflows/ci.yml/badge.svg)](https://github.com/elasticjava/viture-v2/actions/workflows/ci.yml)
+[![Security](https://github.com/elasticjava/viture-v2/actions/workflows/security.yml/badge.svg)](https://github.com/elasticjava/viture-v2/actions/workflows/security.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](Cargo.toml)
+
 A dependency-free Rust driver for **VITURE Gen2 XR glasses** — no vendor SDK, no `libc`,
 no crates at all.
 
@@ -144,6 +149,28 @@ The instruments the protocol was reverse engineered with. `v2_hidraw.py` and `v2
 talk the protocol directly and were the first confirmation. `sdk_probe.c` and `sdk_map.c`
 drive the official SDK through `dlopen` to produce labelled captures — they need the
 VITURE SDK, which is **not** included here and is not redistributable.
+
+## Maintenance
+
+CI runs format, clippy with warnings denied, the tests and every cross-compilation
+target on each push, and once a week on a schedule so toolchain drift surfaces without
+a commit. The Android job additionally asserts that the exported C ABI is complete —
+that is the contract the JNI bridge links against, so breaking it should fail here and
+not on a phone.
+
+Security runs daily: `cargo-deny` for advisories, licences and sources, CodeQL, and a
+report of the `unsafe` surface. Dependabot and Renovate are both configured; patch,
+minor and GitHub Actions updates merge themselves once CI is green, cargo majors stay
+open for review. `master` is protected and requires the test job to pass.
+
+Tagging `v*` builds the Linux binary, the static aarch64 build for Termux and the
+Android shared library, and publishes them with checksums.
+
+## Contributing
+
+Protocol claims need evidence from hardware, not reasoning — see
+[CONTRIBUTING.md](CONTRIBUTING.md). Security policy and the trust boundary of a USB
+driver are in [SECURITY.md](SECURITY.md).
 
 ## License
 

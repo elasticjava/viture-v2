@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  artifacts:
+    name: build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            artifact: viture-v2
+          - name: android-termux-aarch64
+            target: aarch64-unknown-linux-musl
+            artifact: viture-v2
+          - name: android-jni-arm64-v8a
+            target: aarch64-linux-android
+            artifact: libviture_v2.so
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: nttld/setup-ndk@v1
+        if: matrix.target == 'aarch64-linux-android'
+        id: ndk
+        with:
+          ndk-version: r27
+
+      - name: Build
+        env:
+          NDK: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-linux-android" ]; then
+            export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+          fi
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.artifact }}" \
+             "dist/${{ matrix.artifact }}-${{ matrix.name }}"
+          sha256sum "dist/${{ matrix.artifact }}-${{ matrix.name }}" \
+            > "dist/${{ matrix.artifact }}-${{ matrix.name }}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+
+  publish:
+    needs: artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+      - name: Publish the release
+        run: |
+          find staged -type f -print
+          gh release create "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --title "${GITHUB_REF_NAME}" \
+            $(find staged -type f | tr '\n' ' ')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
