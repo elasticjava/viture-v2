@@ -13,7 +13,7 @@ use viture_v2::pointer::{PhoneSensor, Pointer};
 use viture_v2::ring::Ring;
 use viture_v2::uring::Uring;
 use viture_v2::usbfs::{self, Usbfs};
-use viture_v2::{Device, Event, Pose, Raw, Rate, Streams, Transport};
+use viture_v2::{Device, Event, Pose, Rate, Raw, Streams, Transport};
 
 const VID: u16 = 0x35CA;
 const PID_PRO2: u16 = 0x1301;
@@ -87,7 +87,10 @@ fn termux(fd: i32) {
         Err(e) => println!("worn           — ({e})"),
     }
 
-    let secs: u64 = std::env::var("VITURE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let secs: u64 = std::env::var("VITURE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
     if std::env::var("VITURE_MODE").as_deref() == Ok("pointer") {
         return pointer(dev, secs);
     }
@@ -95,7 +98,10 @@ fn termux(fd: i32) {
     println!("\n{secs} s of pose stream …");
     pump(dev, Streams::POSE, secs, Rate::Hz120, |d| {
         let s = d.transport_mut().stats;
-        format!("{} URB submits, {} reaps, {} waits", s.submits, s.reaps, s.waits)
+        format!(
+            "{} URB submits, {} reaps, {} waits",
+            s.submits, s.reaps, s.waits
+        )
     });
 }
 
@@ -153,7 +159,11 @@ fn info(dev: &mut Device<Hidraw>) {
     let mut buf = [0u8; 64];
     match dev.serial(&mut buf) {
         // The serial travels in plaintext; only show a fragment.
-        Ok(s) => println!("serial         {}… ({} chars)", &s[..s.len().min(4)], s.len()),
+        Ok(s) => println!(
+            "serial         {}… ({} chars)",
+            &s[..s.len().min(4)],
+            s.len()
+        ),
         Err(e) => println!("serial         — ({e})"),
     }
     report("brightness", dev.brightness());
@@ -188,7 +198,9 @@ fn run(backend: &str, streams: Streams, secs: u64, rate: Rate) {
     match backend {
         "hidraw" => {
             let dev = Device::new(Hidraw::new(hid_fd()));
-            pump(dev, streams, secs, rate, |d| format!("{} syscalls", d.transport_mut().syscalls));
+            pump(dev, streams, secs, rate, |d| {
+                format!("{} syscalls", d.transport_mut().syscalls)
+            });
         }
         "usbfs" => match usbfs::find_fd(VID, PID_PRO2).and_then(|fd| Usbfs::new(fd, 0)) {
             Ok(u) => {
@@ -239,8 +251,10 @@ fn spawn_reader<T: Transport + Send + 'static>(
         // Coalesce notifications: only wake once enough has piled up. That is
         // the io_uring batching idea one level up. 1 means wake per event,
         // which is the lowest latency and the highest CPU cost.
-        let coalesce: usize =
-            std::env::var("VITURE_COALESCE").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let coalesce: usize = std::env::var("VITURE_COALESCE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
         // The 50 ms window only exists so the stop flag is noticed promptly;
         // it is not polling, the thread sleeps in the kernel.
         while !stop.load(Ordering::Relaxed) {
@@ -284,8 +298,12 @@ where
     let ring: Arc<Ring<Sample, RING_CAP>> = Arc::new(Ring::new());
     let stop = Arc::new(AtomicBool::new(false));
     let cpu_start = cpu_ns();
-    let reader =
-        spawn_reader(dev, Arc::clone(&ring), Arc::clone(&stop), std::thread::current());
+    let reader = spawn_reader(
+        dev,
+        Arc::clone(&ring),
+        Arc::clone(&stop),
+        std::thread::current(),
+    );
 
     let start = Instant::now();
     let limit = Duration::from_secs(secs);
@@ -332,7 +350,10 @@ where
 
     println!("\n── {dt:.1}s ──");
     println!("events           {total}  ({:.0} Hz)", total as f64 / dt);
-    println!("ring             {batches} drains, largest {biggest}, {} dropped", ring.dropped());
+    println!(
+        "ring             {batches} drains, largest {biggest}, {} dropped",
+        ring.dropped()
+    );
     println!("kernel path      {}", summary(&mut dev));
     println!(
         "cpu time         {:.1} ms  ({:.2} % of one core)",
@@ -363,19 +384,24 @@ fn pointer<T: Transport + Send + 'static>(mut dev: Device<T>, secs: u64) {
 
     let ring: Arc<Ring<Sample, RING_CAP>> = Arc::new(Ring::new());
     let stop = Arc::new(AtomicBool::new(false));
-    let reader =
-        spawn_reader(dev, Arc::clone(&ring), Arc::clone(&stop), std::thread::current());
+    let reader = spawn_reader(
+        dev,
+        Arc::clone(&ring),
+        Arc::clone(&stop),
+        std::thread::current(),
+    );
 
     let mut cursor = Pointer::default();
-    if let Ok(d) = std::env::var("VITURE_DISTANCE").map(|v| v.parse::<f32>()) {
-        if let Ok(d) = d {
-            cursor.distance = d;
-        }
+    if let Ok(Ok(d)) = std::env::var("VITURE_DISTANCE").map(|v| v.parse::<f32>()) {
+        cursor.distance = d;
     }
 
     let start = Instant::now();
     let limit = Duration::from_secs(secs);
-    let mut head = Pose { tick: 0, q: [1.0, 0.0, 0.0, 0.0] };
+    let mut head = Pose {
+        tick: 0,
+        q: [1.0, 0.0, 0.0, 0.0],
+    };
     let (mut head_samples, mut centred) = (0u64, false);
     let mut last_print = Instant::now();
 

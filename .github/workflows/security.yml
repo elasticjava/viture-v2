@@ -1,0 +1,62 @@
+name: Security
+
+on:
+  push:
+    branches: [master]
+    paths: ["**/Cargo.toml", "**/Cargo.lock", "deny.toml", ".github/workflows/security.yml"]
+  pull_request:
+  # Daily: an advisory published today should not wait for the next commit.
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: advisories, licences, sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Checks the RustSec advisory database, licence policy, banned crates and
+      # that everything comes from crates.io. The crate has no dependencies
+      # today, which is the point — this job keeps it that way.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
+  unsafe-audit:
+    name: unsafe surface
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # This driver needs `unsafe` — raw syscalls, mmap, FFI. What it must not
+      # do is grow that surface unnoticed, so the count is reported on every
+      # run and shows up in the diff of the job log.
+      - name: Count unsafe blocks per file
+        run: |
+          set -euo pipefail
+          total=0
+          for f in src/*.rs; do
+            n=$(grep -c 'unsafe' "$f" || true)
+            printf '%-20s %s\n' "$(basename "$f")" "$n"
+            total=$((total + n))
+          done
+          echo "total: $total"
+
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: rust
+      - uses: github/codeql-action/autobuild@v3
+      - uses: github/codeql-action/analyze@v3

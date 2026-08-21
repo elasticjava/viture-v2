@@ -193,7 +193,9 @@ impl Uring {
             (sqe.add(16) as *mut u64).write(self.bufs[idx].as_mut_ptr() as u64);
             (sqe.add(24) as *mut u32).write(FRAME_MAX as u32);
             (sqe.add(32) as *mut u64).write(idx as u64); // user_data
-            self.sq_array.add(slot).write(self.sq_local_tail & self.sq_mask);
+            self.sq_array
+                .add(slot)
+                .write(self.sq_local_tail & self.sq_mask);
         }
         self.sq_local_tail = self.sq_local_tail.wrapping_add(1);
         self.to_submit += 1;

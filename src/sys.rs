@@ -110,6 +110,8 @@ pub const PROT_WRITE: usize = 2;
 pub const MAP_SHARED: usize = 1;
 pub const MAP_POPULATE: usize = 0x8000;
 
+/// # Safety
+/// Maps kernel memory; the caller owns the returned range until `munmap`.
 #[inline]
 pub unsafe fn mmap(
     len: usize,
@@ -126,6 +128,8 @@ pub unsafe fn mmap(
     }
 }
 
+/// # Safety
+/// `addr`/`len` must describe a mapping obtained from [`mmap`].
 #[inline]
 pub unsafe fn munmap(addr: *mut u8, len: usize) -> std::io::Result<()> {
     wrap(syscall6(nr::MUNMAP, addr as usize, len, 0, 0, 0, 0)).map(|_| ())
@@ -134,13 +138,31 @@ pub unsafe fn munmap(addr: *mut u8, len: usize) -> std::io::Result<()> {
 #[inline]
 pub fn read(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     unsafe {
-        wrap(syscall6(nr::READ, fd as usize, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0))
+        wrap(syscall6(
+            nr::READ,
+            fd as usize,
+            buf.as_mut_ptr() as usize,
+            buf.len(),
+            0,
+            0,
+            0,
+        ))
     }
 }
 
 #[inline]
 pub fn write(fd: i32, buf: &[u8]) -> std::io::Result<usize> {
-    unsafe { wrap(syscall6(nr::WRITE, fd as usize, buf.as_ptr() as usize, buf.len(), 0, 0, 0)) }
+    unsafe {
+        wrap(syscall6(
+            nr::WRITE,
+            fd as usize,
+            buf.as_ptr() as usize,
+            buf.len(),
+            0,
+            0,
+            0,
+        ))
+    }
 }
 
 #[inline]
@@ -174,12 +196,20 @@ pub fn wait_readable(fd: i32, timeout_ns: u64) -> std::io::Result<bool> {
 
 /// Waits for arbitrary poll events.
 pub fn wait_events(fd: i32, events: i16, timeout_ns: u64) -> std::io::Result<bool> {
-    let mut pfd = PollFd { fd, events, revents: 0 };
+    let mut pfd = PollFd {
+        fd,
+        events,
+        revents: 0,
+    };
     let ts = Timespec {
         sec: (timeout_ns / 1_000_000_000) as i64,
         nsec: (timeout_ns % 1_000_000_000) as i64,
     };
-    let tsp = if timeout_ns == u64::MAX { 0 } else { &ts as *const Timespec as usize };
+    let tsp = if timeout_ns == u64::MAX {
+        0
+    } else {
+        &ts as *const Timespec as usize
+    };
     loop {
         let r = unsafe { syscall6(nr::PPOLL, &mut pfd as *mut PollFd as usize, 1, tsp, 0, 8, 0) };
         if r == -4 {
@@ -271,12 +301,24 @@ pub fn window_size(fd: i32) -> std::io::Result<WinSize> {
 
 // ---- io_uring --------------------------------------------------------------
 
+/// # Safety
+/// `params` must point at a writable `io_uring_params` (120 bytes).
 #[inline]
 pub unsafe fn io_uring_setup(entries: u32, params: *mut u8) -> std::io::Result<i32> {
-    wrap(syscall6(NR_IO_URING_SETUP, entries as usize, params as usize, 0, 0, 0, 0))
-        .map(|v| v as i32)
+    wrap(syscall6(
+        NR_IO_URING_SETUP,
+        entries as usize,
+        params as usize,
+        0,
+        0,
+        0,
+        0,
+    ))
+    .map(|v| v as i32)
 }
 
+/// # Safety
+/// `fd` must be a ring from [`io_uring_setup`].
 #[inline]
 pub unsafe fn io_uring_enter(
     fd: i32,
@@ -289,6 +331,9 @@ pub unsafe fn io_uring_enter(
 
 /// Variant using `IORING_ENTER_EXT_ARG`: `arg` points at an
 /// `io_uring_getevents_arg` carrying the timeout, so no SQE is spent on it.
+/// # Safety
+/// `fd` must be a ring from [`io_uring_setup`]; `arg`/`argsz` must describe a
+/// valid `io_uring_getevents_arg` or both be zero.
 #[inline]
 pub unsafe fn io_uring_enter_arg(
     fd: i32,

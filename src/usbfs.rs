@@ -55,10 +55,20 @@ struct UsbdevfsIoctl {
 }
 
 fn submiturb() -> usize {
-    sys::ioc(sys::IOC_READ, USBDEVFS_TYPE, 10, core::mem::size_of::<Urb>())
+    sys::ioc(
+        sys::IOC_READ,
+        USBDEVFS_TYPE,
+        10,
+        core::mem::size_of::<Urb>(),
+    )
 }
 fn reapurbndelay() -> usize {
-    sys::ioc(sys::IOC_WRITE, USBDEVFS_TYPE, 13, core::mem::size_of::<usize>())
+    sys::ioc(
+        sys::IOC_WRITE,
+        USBDEVFS_TYPE,
+        13,
+        core::mem::size_of::<usize>(),
+    )
 }
 fn discardurb() -> usize {
     sys::ioc(sys::IOC_NONE, USBDEVFS_TYPE, 11, 0)
@@ -99,15 +109,21 @@ pub fn find_fd(vid: u16, pid: u16) -> Result<i32> {
     for entry in read_dir("/sys/bus/usb/devices")? {
         let dir = entry?.path();
         let hex = |name: &str| {
-            read_to_string(dir.join(name)).ok().and_then(|s| u16::from_str_radix(s.trim(), 16).ok())
+            read_to_string(dir.join(name))
+                .ok()
+                .and_then(|s| u16::from_str_radix(s.trim(), 16).ok())
         };
         if hex("idVendor") != Some(vid) || hex("idProduct") != Some(pid) {
             continue;
         }
         let dec = |name: &str| {
-            read_to_string(dir.join(name)).ok().and_then(|s| s.trim().parse::<u32>().ok())
+            read_to_string(dir.join(name))
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
         };
-        let (Some(bus), Some(dev)) = (dec("busnum"), dec("devnum")) else { continue };
+        let (Some(bus), Some(dev)) = (dec("busnum"), dec("devnum")) else {
+            continue;
+        };
         let path = format!("/dev/bus/usb/{bus:03}/{dev:03}");
         let file = OpenOptions::new().read(true).write(true).open(&path)?;
         return Ok(file.into_raw_fd());
@@ -139,10 +155,17 @@ impl Usbfs {
     /// Takes an open usbfs descriptor, e.g. the one from `termux-usb`.
     pub fn new(fd: i32, ifno: i32) -> Result<Self> {
         // Detach the kernel driver, otherwise CLAIMINTERFACE refuses.
-        let mut req =
-            UsbdevfsIoctl { ifno, ioctl_code: IOCTL_DISCONNECT, data: core::ptr::null_mut() };
-        let reattach =
-            sys::ioctl(fd, usbdevfs_ioctl(), &mut req as *mut UsbdevfsIoctl as usize).is_ok();
+        let mut req = UsbdevfsIoctl {
+            ifno,
+            ioctl_code: IOCTL_DISCONNECT,
+            data: core::ptr::null_mut(),
+        };
+        let reattach = sys::ioctl(
+            fd,
+            usbdevfs_ioctl(),
+            &mut req as *mut UsbdevfsIoctl as usize,
+        )
+        .is_ok();
 
         sys::ioctl(fd, claiminterface(), &ifno as *const i32 as usize).map_err(Error::Io)?;
 
@@ -233,14 +256,22 @@ impl Drop for Usbfs {
             let urb = &mut self.urbs[i] as *mut Urb;
             let _ = sys::ioctl(self.fd, discardurb(), urb as usize);
         }
-        let _ = sys::ioctl(self.fd, releaseinterface(), &self.ifno as *const i32 as usize);
+        let _ = sys::ioctl(
+            self.fd,
+            releaseinterface(),
+            &self.ifno as *const i32 as usize,
+        );
         if self.reattach {
             let mut req = UsbdevfsIoctl {
                 ifno: self.ifno,
                 ioctl_code: IOCTL_CONNECT,
                 data: core::ptr::null_mut(),
             };
-            let _ = sys::ioctl(self.fd, usbdevfs_ioctl(), &mut req as *mut UsbdevfsIoctl as usize);
+            let _ = sys::ioctl(
+                self.fd,
+                usbdevfs_ioctl(),
+                &mut req as *mut UsbdevfsIoctl as usize,
+            );
         }
         let _ = sys::close(self.fd);
     }
@@ -255,8 +286,12 @@ impl Transport for Usbfs {
         self.out_urb.buffer_length = frame.len() as i32;
         self.out_urb.status = 0;
         self.stats.submits += 1;
-        sys::ioctl(self.fd, submiturb(), &mut *self.out_urb as *mut Urb as usize)
-            .map_err(Error::Io)?;
+        sys::ioctl(
+            self.fd,
+            submiturb(),
+            &mut *self.out_urb as *mut Urb as usize,
+        )
+        .map_err(Error::Io)?;
         self.out_pending = true;
         Ok(())
     }

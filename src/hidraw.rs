@@ -25,8 +25,13 @@ pub fn find_fd(vid: u16, pid: u16) -> Result<i32> {
         let name = entry?.file_name();
         let name = name.to_string_lossy().into_owned();
         let uevent = format!("/sys/class/hidraw/{name}/device/uevent");
-        let Ok(text) = std::fs::read_to_string(&uevent) else { continue };
-        if text.lines().any(|l| l.starts_with("HID_ID=") && l.ends_with(&needle)) {
+        let Ok(text) = std::fs::read_to_string(&uevent) else {
+            continue;
+        };
+        if text
+            .lines()
+            .any(|l| l.starts_with("HID_ID=") && l.ends_with(&needle))
+        {
             return open_fd(&format!("/dev/{name}"));
         }
     }

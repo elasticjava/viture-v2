@@ -28,7 +28,6 @@ use crate::pointer::{rotate, Pointer};
 use crate::usbfs::Usbfs;
 use crate::{quat_conj, quat_mul, Device, Event, Rate, Streams, Transport};
 
-
 /// Snapshot handed to the renderer once per frame.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -122,10 +121,16 @@ impl Tracker {
         // Read the static facts while nothing else is using the command path.
         let mut buf = [0u8; 64];
         let info = DeviceInfo {
-            firmware: dev.firmware_version(&mut buf).unwrap_or("unknown").to_owned(),
+            firmware: dev
+                .firmware_version(&mut buf)
+                .unwrap_or("unknown")
+                .to_owned(),
             brightness: dev.brightness().map(i32::from).unwrap_or(-1),
             volume: dev.volume().map(i32::from).unwrap_or(-1),
-            display_mode: dev.get_u8(crate::msg::DISPLAY_MODE).map(i32::from).unwrap_or(-1),
+            display_mode: dev
+                .get_u8(crate::msg::DISPLAY_MODE)
+                .map(i32::from)
+                .unwrap_or(-1),
             worn: dev.worn().unwrap_or(false),
         };
 
@@ -150,7 +155,10 @@ impl Tracker {
 
         Ok(Tracker {
             hot,
-            cold: Mutex::new(Cold { pointer: Pointer::default(), lookahead_s: 0.020 }),
+            cold: Mutex::new(Cold {
+                pointer: Pointer::default(),
+                lookahead_s: 0.020,
+            }),
             stop,
             reader: Some(reader),
             info,
@@ -209,7 +217,11 @@ impl Tracker {
         let phone = Hot::load_quat(&self.hot.phone);
 
         let (head_ref, lookahead, cursor) = match self.cold.lock() {
-            Ok(c) => (c.pointer.head_ref, c.lookahead_s, c.pointer.cursor(head, phone)),
+            Ok(c) => (
+                c.pointer.head_ref,
+                c.lookahead_s,
+                c.pointer.cursor(head, phone),
+            ),
             Err(_) => ([1.0, 0.0, 0.0, 0.0], 0.0, None),
         };
 
@@ -363,41 +375,6 @@ pub unsafe extern "C" fn xr_state(t: *mut Tracker, out: *mut XrState) -> i32 {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn zero_rate_leaves_orientation_alone() {
-        let q = [1.0, 0.0, 0.0, 0.0];
-        assert_eq!(integrate(q, [0.0, 0.0, 0.0], 0.02), q);
-    }
-
-    /// A constant rate about Z for dt must rotate by exactly omega * dt.
-    #[test]
-    fn constant_rate_rotates_by_omega_dt() {
-        let omega = [0.0, 0.0, 1.0]; // 1 rad/s
-        let dt = 0.5; // -> 0.5 rad
-        let q = integrate([1.0, 0.0, 0.0, 0.0], omega, dt);
-        let angle = 2.0 * q[0].acos();
-        assert!((angle - 0.5).abs() < 1e-4, "angle = {angle}");
-        assert!((q[3] - (0.25f32).sin()).abs() < 1e-4, "z = {}", q[3]);
-    }
-
-    #[test]
-    fn prediction_stays_normalised() {
-        let q = integrate([1.0, 0.0, 0.0, 0.0], [3.0, -2.0, 1.5], 0.03);
-        let n = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
-        assert!((n - 1.0).abs() < 1e-5, "|q| = {n}");
-    }
-
-    #[test]
-    fn state_is_plain_old_data() {
-        // The JNI shim copies this straight through, so no padding surprises.
-        assert_eq!(core::mem::size_of::<XrState>(), 4 * 4 + 4 * 4 + 4 + 4 + 4 + 4 + 8 + 8);
-    }
-}
-
 /// Fills `out` with `[roll, pitch, yaw, qw, qx, qy, qz]`, matching what the
 /// vendor SDK hands to its pose callback.
 ///
@@ -459,4 +436,42 @@ pub unsafe extern "C" fn xr_firmware(t: *mut Tracker, out: *mut u8, cap: usize) 
     core::ptr::copy_nonoverlapping(bytes.as_ptr(), out, n);
     *out.add(n) = 0;
     n as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_rate_leaves_orientation_alone() {
+        let q = [1.0, 0.0, 0.0, 0.0];
+        assert_eq!(integrate(q, [0.0, 0.0, 0.0], 0.02), q);
+    }
+
+    /// A constant rate about Z for dt must rotate by exactly omega * dt.
+    #[test]
+    fn constant_rate_rotates_by_omega_dt() {
+        let omega = [0.0, 0.0, 1.0]; // 1 rad/s
+        let dt = 0.5; // -> 0.5 rad
+        let q = integrate([1.0, 0.0, 0.0, 0.0], omega, dt);
+        let angle = 2.0 * q[0].acos();
+        assert!((angle - 0.5).abs() < 1e-4, "angle = {angle}");
+        assert!((q[3] - (0.25f32).sin()).abs() < 1e-4, "z = {}", q[3]);
+    }
+
+    #[test]
+    fn prediction_stays_normalised() {
+        let q = integrate([1.0, 0.0, 0.0, 0.0], [3.0, -2.0, 1.5], 0.03);
+        let n = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+        assert!((n - 1.0).abs() < 1e-5, "|q| = {n}");
+    }
+
+    #[test]
+    fn state_is_plain_old_data() {
+        // The JNI shim copies this straight through, so no padding surprises.
+        assert_eq!(
+            core::mem::size_of::<XrState>(),
+            4 * 4 + 4 * 4 + 4 + 4 + 4 + 4 + 8 + 8
+        );
+    }
 }

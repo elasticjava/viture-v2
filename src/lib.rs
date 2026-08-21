@@ -23,10 +23,10 @@ pub mod hidraw;
 pub mod pointer;
 pub mod ring;
 pub mod sys;
-pub mod usbfs;
-pub mod xr;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod uring;
+pub mod usbfs;
+pub mod xr;
 
 /// Fixed report size of the device.
 pub const FRAME_MAX: usize = 64;
@@ -235,7 +235,10 @@ impl Pose {
     /// turned since the last recentre.
     #[inline]
     pub fn relative_to(&self, reference: &Pose) -> Pose {
-        Pose { tick: self.tick, q: quat_mul(quat_conj(reference.q), self.q) }
+        Pose {
+            tick: self.tick,
+            q: quat_mul(quat_conj(reference.q), self.q),
+        }
     }
 }
 
@@ -316,7 +319,11 @@ pub struct Device<T: Transport> {
 
 impl<T: Transport> Device<T> {
     pub fn new(transport: T) -> Self {
-        Device { transport, rx: [0; FRAME_MAX], tx: [0; FRAME_MAX] }
+        Device {
+            transport,
+            rx: [0; FRAME_MAX],
+            tx: [0; FRAME_MAX],
+        }
     }
 
     pub fn transport_mut(&mut self) -> &mut T {
@@ -418,7 +425,12 @@ impl<T: Transport> Device<T> {
     /// Starts or stops the IMU streams. One command, no handshake.
     pub fn set_imu(&mut self, streams: Streams, rate: Rate) -> Result<()> {
         let mut out = [0u8; 4];
-        self.request(msg::IMU_CTRL, &[streams.0, rate as u8], &mut out, REPLY_TIMEOUT_NS)?;
+        self.request(
+            msg::IMU_CTRL,
+            &[streams.0, rate as u8],
+            &mut out,
+            REPLY_TIMEOUT_NS,
+        )?;
         Ok(())
     }
 
@@ -447,8 +459,16 @@ mod tests {
     #[test]
     fn builds_imu_command_like_the_sdk() {
         let mut buf = [0u8; FRAME_MAX];
-        let f = build(&mut buf, msg::IMU_CTRL, &[Streams::POSE.0, Rate::Hz120 as u8]).unwrap();
-        assert_eq!(f, &[0x10, 0x00, 0x01, 0x03, 0x02, 0x00, 0x03, 0x00, 0x01, 0x02]);
+        let f = build(
+            &mut buf,
+            msg::IMU_CTRL,
+            &[Streams::POSE.0, Rate::Hz120 as u8],
+        )
+        .unwrap();
+        assert_eq!(
+            f,
+            &[0x10, 0x00, 0x01, 0x03, 0x02, 0x00, 0x03, 0x00, 0x01, 0x02]
+        );
     }
 
     #[test]
@@ -494,7 +514,10 @@ mod tests {
     /// Relative orientation against itself must be the identity rotation.
     #[test]
     fn relative_to_self_is_identity() {
-        let p = Pose { tick: 0, q: [0.1153, 0.9922, -0.0417, -0.0051] };
+        let p = Pose {
+            tick: 0,
+            q: [0.1153, 0.9922, -0.0417, -0.0051],
+        };
         let r = p.relative_to(&p);
         assert!((r.q[0] - 1.0).abs() < 1e-3, "w = {}", r.q[0]);
         for c in &r.q[1..] {

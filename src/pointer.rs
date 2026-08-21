@@ -34,7 +34,10 @@ pub struct Orientation {
 }
 
 impl Orientation {
-    pub const IDENTITY: Orientation = Orientation { q: [1.0, 0.0, 0.0, 0.0], seq: 0 };
+    pub const IDENTITY: Orientation = Orientation {
+        q: [1.0, 0.0, 0.0, 0.0],
+        seq: 0,
+    };
 }
 
 /// Reads the phone's own rotation vector via `termux-sensor`.
@@ -76,7 +79,12 @@ impl PhoneSensor {
             std::thread::spawn(move || parse_loop(stdout, latest, quat, stop));
         }
 
-        Ok(PhoneSensor { child, latest, quat, stop })
+        Ok(PhoneSensor {
+            child,
+            latest,
+            quat,
+            stop,
+        })
     }
 
     /// Most recent orientation, or the identity if nothing has arrived yet.
@@ -101,7 +109,10 @@ impl Drop for PhoneSensor {
         let _ = self.child.kill();
         let _ = self.child.wait();
         // Release the sensor so Termux:API stops holding a wakelock on it.
-        let _ = Command::new("termux-sensor").arg("-c").stdout(Stdio::null()).status();
+        let _ = Command::new("termux-sensor")
+            .arg("-c")
+            .stdout(Stdio::null())
+            .status();
     }
 }
 
@@ -153,7 +164,7 @@ fn parse_loop(
             }
             continue;
         }
-        if let Some(v) = line.trim().trim_end_matches(',').parse::<f32>().ok() {
+        if let Ok(v) = line.trim().trim_end_matches(',').parse::<f32>() {
             values.push(v);
         }
     }
@@ -205,7 +216,10 @@ impl Pointer {
         if dir[1] <= 0.05 {
             return None;
         }
-        Some((dir[0] / dir[1] * self.distance, dir[2] / dir[1] * self.distance))
+        Some((
+            dir[0] / dir[1] * self.distance,
+            dir[2] / dir[1] * self.distance,
+        ))
     }
 }
 
@@ -250,15 +264,23 @@ mod tests {
     fn turning_the_head_along_does_not_move_the_cursor() {
         let mut p = Pointer::default();
         p.recentre([1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
-        let before = p.cursor([1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]).unwrap();
+        let before = p
+            .cursor([1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0])
+            .unwrap();
 
         // 20 degrees about Z, applied to both.
         let a = 20f32.to_radians() / 2.0;
         let turn = [a.cos(), 0.0, 0.0, a.sin()];
         let after = p.cursor(turn, turn).unwrap();
 
-        assert!((before.0 - after.0).abs() < 1e-4, "x drifted: {before:?} -> {after:?}");
-        assert!((before.1 - after.1).abs() < 1e-4, "y drifted: {before:?} -> {after:?}");
+        assert!(
+            (before.0 - after.0).abs() < 1e-4,
+            "x drifted: {before:?} -> {after:?}"
+        );
+        assert!(
+            (before.1 - after.1).abs() < 1e-4,
+            "y drifted: {before:?} -> {after:?}"
+        );
     }
 
     /// Turning only the phone must move the cursor.

@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  # Weekly, so toolchain drift and new lints surface even when nobody pushes.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+# Least privilege by default; jobs that need more ask for it explicitly.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: format, lint, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features
+      - run: cargo test --release
+
+  cross:
+    name: cross-compile ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          # Static binary that also runs on Android under Termux.
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target ${{ matrix.target }}
+
+  android:
+    name: android cdylib
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27
+      - name: Build the shared library the Android app links
+        env:
+          NDK: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+          cargo build --release --target aarch64-linux-android
+      - name: Check the exported ABI is complete
+        run: |
+          set -euo pipefail
+          nm -D --defined-only target/aarch64-linux-android/release/libviture_v2.so \
+            | grep -oE ' T xr_[a-z0-9_]+' | sort > exported.txt
+          for symbol in xr_open xr_close xr_state xr_pose7 xr_pose_fresh \
+                        xr_recentre xr_set_phone_quat xr_brightness xr_firmware; do
+            grep -q " T $symbol\$" exported.txt || { echo "missing: $symbol"; exit 1; }
+          done
+          echo "all expected symbols present"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libviture_v2-arm64-v8a
+          path: target/aarch64-linux-android/release/libviture_v2.so
+          retention-days: 14
