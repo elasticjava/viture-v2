@@ -57,6 +57,8 @@ struct Hot {
     reader_alive: AtomicBool,
     /// Errno of the error that ended the reader, or 0.
     reader_errno: AtomicU32,
+    /// A display mode waiting to be sent, tagged with [`PENDING_SET`].
+    pending_mode: AtomicU32,
     /// Events seen that were neither pose nor raw — a mapping gap would show up
     /// here rather than as silence.
     other_events: AtomicU64,
@@ -105,6 +107,9 @@ struct Cold {
     /// semantics the Kotlin side used before the maths moved down here.
     ref_yaw: (f32, f32),
 }
+
+/// Marks [`Hot::pending_mode`] as carrying a request rather than being idle.
+const PENDING_SET: u32 = 0x100;
 
 /// Cancels the reference heading from an orientation: `conj(yaw_twist) * q`,
 /// with `yaw_twist = (cos, 0, sin, 0)`.
@@ -223,6 +228,18 @@ impl Tracker {
         [roll, pitch, yaw, q[0], q[1], q[2], q[3]]
     }
 
+    /// Queues a display-mode change for the reader thread to send.
+    ///
+    /// The reader owns the transport, so the command cannot simply be issued
+    /// here. It is handed over as a pending request and goes out between two
+    /// reads, which is also the only point where the reply can be observed.
+    pub fn request_display_mode(&self, mode: u8) -> i32 {
+        self.hot
+            .pending_mode
+            .store(mode as u32 | PENDING_SET, Ordering::Release);
+        0
+    }
+
     /// True once per new pose sample; clears the flag.
     pub fn pose_fresh(&self) -> bool {
         self.hot.fresh.swap(false, Ordering::Acquire)
@@ -311,6 +328,12 @@ impl Drop for Tracker {
 fn read_loop<T: Transport>(mut dev: Device<T>, hot: Arc<Hot>, stop: Arc<AtomicBool>) {
     hot.reader_alive.store(true, Ordering::Release);
     while !stop.load(Ordering::Relaxed) {
+        // Send a queued display-mode change between reads — the only place the
+        // transport is free.
+        let pending = hot.pending_mode.swap(0, Ordering::Acquire);
+        if pending & PENDING_SET != 0 {
+            let _ = dev.set_display_mode_raw((pending & 0xFF) as u8);
+        }
         match dev.next_event(50_000_000) {
             Ok(Some(Event::Pose(p))) => {
                 Hot::store_quat(&hot.head, p.q);
@@ -604,4 +627,20 @@ pub unsafe extern "C" fn xr_diag(t: *mut Tracker, out: *mut i64) -> i32 {
     ];
     core::ptr::copy_nonoverlapping(values.as_ptr(), out, values.len());
     0
+}
+
+/// Switches the panel's display mode. `0x31` = 1920×1080 2D, `0x32` = 3840×1080
+/// side-by-side 3D.
+///
+/// The device owns the command path from its reader thread, so this reopens a
+/// short-lived command channel rather than fighting it. Returns 0 on success.
+///
+/// # Safety
+/// `t` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn xr_set_display_mode(t: *mut Tracker, mode: u8) -> i32 {
+    match t.as_ref() {
+        Some(t) => t.request_display_mode(mode),
+        None => -1,
+    }
 }

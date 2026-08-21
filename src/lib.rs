@@ -56,6 +56,17 @@ pub mod msg {
     /// Wear status, 0 = not worn.
     pub const WEAR_STATUS: u16 = 0x3321;
 
+    // Writes. The scheme is regular: a getter's leading nibble is 3, its setter's
+    // is 0, and the remaining twelve bits are the same. That also explains
+    // [`IMU_CTRL`] — it was always a write.
+
+    /// Set the display mode, payload one byte, see [`super::DisplayMode`].
+    pub const SET_DISPLAY_MODE: u16 = 0x0141;
+    /// Set the display duty cycle, payload one byte (percent).
+    pub const SET_DUTY_CYCLE: u16 = 0x0125;
+    /// Set the volume level, payload two bytes.
+    pub const SET_VOLUME: u16 = 0x0201;
+
     /// Event: fused orientation (quaternion).
     pub const EVT_POSE: u16 = 0x7308;
     /// Event: raw data (gyroscope + accelerometer).
@@ -420,6 +431,20 @@ impl<T: Transport> Device<T> {
 
     pub fn display_mode(&mut self) -> Result<DisplayMode> {
         Ok(DisplayMode::from_raw(self.get_u8(msg::DISPLAY_MODE)?))
+    }
+
+    /// Switches the panel between its display modes.
+    ///
+    /// `0x32` is the side-by-side 3D mode: the glasses take a 3840×1080 frame and
+    /// send the left half to the left eye and the right half to the right, each
+    /// a full 1920×1080. `0x31` is ordinary 2D.
+    ///
+    /// Changing this re-negotiates the video link, so the host briefly loses the
+    /// display and may land on whatever mode it likes when it comes back.
+    pub fn set_display_mode_raw(&mut self, mode: u8) -> Result<()> {
+        let mut out = [0u8; 4];
+        self.request(msg::SET_DISPLAY_MODE, &[mode], &mut out, REPLY_TIMEOUT_NS)?;
+        Ok(())
     }
 
     /// Starts or stops the IMU streams. One command, no handshake.
