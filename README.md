@@ -30,8 +30,10 @@ changing.
 | Firmware version, serial number | works |
 | Brightness, volume, duty cycle, display mode | works (read) |
 | Wear status | works — more reliable than the vendor SDK, see PROTOCOL.md |
+| Head-relative pointing (glasses + phone IMU) | works, `src/pointer.rs` |
+| Look-ahead prediction from the raw gyro | works, `src/xr.rs` |
+| C ABI for an Android app (JNI) | works, drives the [uxspace fork](https://github.com/elasticjava/uxspace) |
 | Setters (brightness, display mode, …) | not mapped yet |
-| Sensor fusion / prediction | not implemented |
 
 ## Verified on
 
