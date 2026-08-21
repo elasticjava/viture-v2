@@ -29,7 +29,7 @@ use std::thread::JoinHandle;
 use crate::pointer::{rotate, Pointer};
 
 use crate::usbfs::Usbfs;
-use crate::{quat_conj, quat_mul, Device, Event, Rate, Streams, Transport};
+use crate::{quat_mul, Device, Event, Rate, Streams, Transport};
 
 /// Snapshot handed to the renderer once per frame.
 #[repr(C)]
@@ -89,6 +89,33 @@ struct Cold {
     pointer: Pointer,
     /// How far ahead to extrapolate, in seconds.
     lookahead_s: f32,
+    /// Reference heading as a unit `(cos, sin)` about world Y.
+    ///
+    /// Recentring cancels **heading only**. Pitch and roll stay as the device
+    /// reports them, which keeps them gravity-anchored. A full-orientation
+    /// recentre folds the reference pitch into the yaw axis, and the scene then
+    /// tilts as you pan — the workspace ends up visibly angled. This mirrors the
+    /// semantics the Kotlin side used before the maths moved down here.
+    ref_yaw: (f32, f32),
+}
+
+/// Cancels the reference heading from an orientation: `conj(yaw_twist) * q`,
+/// with `yaw_twist = (cos, 0, sin, 0)`.
+#[inline]
+fn recentre_yaw(q: [f32; 4], (c, s): (f32, f32)) -> [f32; 4] {
+    let [w, x, y, z] = q;
+    [c * w + s * y, c * x - s * z, c * y - s * w, c * z + s * x]
+}
+
+/// The heading part of an orientation, as a unit `(cos, sin)` about world Y.
+#[inline]
+fn yaw_twist(q: [f32; 4]) -> (f32, f32) {
+    let n = (q[0] * q[0] + q[2] * q[2]).sqrt();
+    if n > 1e-6 {
+        (q[0] / n, q[2] / n)
+    } else {
+        (1.0, 0.0)
+    }
 }
 
 /// Device facts read once while the command path is still free, before the
@@ -161,6 +188,7 @@ impl Tracker {
             cold: Mutex::new(Cold {
                 pointer: Pointer::default(),
                 lookahead_s: 0.020,
+                ref_yaw: (1.0, 0.0),
             }),
             stop,
             reader: Some(reader),
@@ -193,11 +221,17 @@ impl Tracker {
     }
 
     /// Declares the current head and phone orientation to be the centre.
+    ///
+    /// The head reference is heading-only; the phone reference is the full
+    /// orientation, because the pointer is expressed in the head frame anyway.
     pub fn recentre(&self) {
         let head = Hot::load_quat(&self.hot.head);
         let phone = Hot::load_quat(&self.hot.phone);
         if let Ok(mut c) = self.cold.lock() {
-            c.pointer.recentre(head, phone);
+            c.ref_yaw = yaw_twist(head);
+            // The head handed to the pointer is already recentred, so its own
+            // head reference stays the identity.
+            c.pointer.recentre([1.0, 0.0, 0.0, 0.0], phone);
         }
     }
 
@@ -219,16 +253,18 @@ impl Tracker {
         let gyro = Hot::load_vec3(&self.hot.gyro);
         let phone = Hot::load_quat(&self.hot.phone);
 
-        let (head_ref, lookahead, cursor) = match self.cold.lock() {
-            Ok(c) => (
-                c.pointer.head_ref,
-                c.lookahead_s,
-                c.pointer.cursor(head, phone),
-            ),
-            Err(_) => ([1.0, 0.0, 0.0, 0.0], 0.0, None),
+        let (relative, lookahead, cursor) = match self.cold.lock() {
+            Ok(c) => {
+                // Heading-only recentring: pitch and roll stay gravity-anchored,
+                // so panning cannot tilt the workspace.
+                let relative = recentre_yaw(head, c.ref_yaw);
+                (relative, c.lookahead_s, c.pointer.cursor(relative, phone))
+            }
+            Err(_) => (head, 0.0, None),
         };
 
-        let relative = quat_mul(quat_conj(head_ref), head);
+        // Extrapolating the recentred orientation rather than the raw one keeps
+        // the prediction in the frame the renderer actually draws in.
         let predicted = integrate(relative, gyro, lookahead);
 
         XrState {
@@ -467,6 +503,46 @@ mod tests {
         let q = integrate([1.0, 0.0, 0.0, 0.0], [3.0, -2.0, 1.5], 0.03);
         let n = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
         assert!((n - 1.0).abs() < 1e-5, "|q| = {n}");
+    }
+
+    /// Recentring must cancel heading and leave pitch and roll alone — the
+    /// property the Kotlin side relied on before this moved into the driver.
+    #[test]
+    fn recentre_cancels_heading_but_keeps_pitch() {
+        // 30 degrees yaw about Y, combined with 20 degrees pitch about X.
+        let ya = 30f32.to_radians() / 2.0;
+        let pa = 20f32.to_radians() / 2.0;
+        let yaw = [ya.cos(), 0.0, ya.sin(), 0.0];
+        let pitch = [pa.cos(), pa.sin(), 0.0, 0.0];
+        let head = quat_mul(yaw, pitch);
+
+        let recentred = recentre_yaw(head, yaw_twist(head));
+        // Mind the naming clash: `euler_deg` follows the aerospace convention
+        // where the Y rotation is called "pitch" and Z is "yaw", while the
+        // glasses frame uses Y as the heading (up) axis. Cancelling the heading
+        // about Y therefore has to leave the X rotation untouched — and that is
+        // what `euler_deg` reports as roll.
+        let [roll, heading, _] = crate::Pose {
+            tick: 0,
+            q: recentred,
+        }
+        .euler_deg();
+
+        assert!(heading.abs() < 0.5, "heading not cancelled: {heading}");
+        assert!(
+            (roll.abs() - 20.0).abs() < 0.5,
+            "the X rotation was changed: {roll}"
+        );
+    }
+
+    /// Pure heading must recentre to the identity.
+    #[test]
+    fn pure_heading_recentres_to_identity() {
+        let a = 47f32.to_radians() / 2.0;
+        let head = [a.cos(), 0.0, a.sin(), 0.0];
+        let r = recentre_yaw(head, yaw_twist(head));
+        assert!((r[0] - 1.0).abs() < 1e-4, "w = {}", r[0]);
+        assert!(r[2].abs() < 1e-4, "y = {}", r[2]);
     }
 
     #[test]
