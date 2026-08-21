@@ -53,6 +53,13 @@ pub struct XrState {
 #[derive(Default)]
 struct Hot {
     head: [AtomicU32; 4],
+    /// Set while the reader thread is alive, cleared when it leaves.
+    reader_alive: AtomicBool,
+    /// Errno of the error that ended the reader, or 0.
+    reader_errno: AtomicU32,
+    /// Events seen that were neither pose nor raw — a mapping gap would show up
+    /// here rather than as silence.
+    other_events: AtomicU64,
     fresh: AtomicBool,
     gyro: [AtomicU32; 3],
     phone: [AtomicU32; 4],
@@ -295,6 +302,7 @@ impl Drop for Tracker {
 }
 
 fn read_loop<T: Transport>(mut dev: Device<T>, hot: Arc<Hot>, stop: Arc<AtomicBool>) {
+    hot.reader_alive.store(true, Ordering::Release);
     while !stop.load(Ordering::Relaxed) {
         match dev.next_event(50_000_000) {
             Ok(Some(Event::Pose(p))) => {
@@ -307,10 +315,23 @@ fn read_loop<T: Transport>(mut dev: Device<T>, hot: Arc<Hot>, stop: Arc<AtomicBo
                     a.store(v.to_bits(), Ordering::Relaxed);
                 }
             }
-            Ok(Some(Event::Other(_))) | Ok(None) => {}
-            Err(_) => break,
+            Ok(Some(Event::Other(_))) => {
+                hot.other_events.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Record why the reader gave up. Silence here was impossible to
+                // diagnose from the outside.
+                let code = match &e {
+                    crate::Error::Io(io) => io.raw_os_error().unwrap_or(-1),
+                    _ => -2,
+                };
+                hot.reader_errno.store(code as u32, Ordering::Relaxed);
+                break;
+            }
         }
     }
+    hot.reader_alive.store(false, Ordering::Release);
     let _ = dev.set_imu(Streams::OFF, Rate::Hz120);
 }
 
@@ -553,4 +574,27 @@ mod tests {
             4 * 4 + 4 * 4 + 4 + 4 + 4 + 4 + 8 + 8
         );
     }
+}
+
+/// Diagnostics for the JNI side: `[head_samples, phone_samples, reader_alive,
+/// reader_errno, other_events]`. Silence in the pose stream is otherwise
+/// impossible to tell apart from a dead reader thread.
+///
+/// # Safety
+/// `t` must be live and `out` must hold five `i64`s.
+#[no_mangle]
+pub unsafe extern "C" fn xr_diag(t: *mut Tracker, out: *mut i64) -> i32 {
+    let Some(t) = t.as_ref() else { return -1 };
+    if out.is_null() {
+        return -1;
+    }
+    let values = [
+        t.hot.head_samples.load(Ordering::Relaxed) as i64,
+        t.hot.phone_samples.load(Ordering::Relaxed) as i64,
+        t.hot.reader_alive.load(Ordering::Acquire) as i64,
+        t.hot.reader_errno.load(Ordering::Relaxed) as i32 as i64,
+        t.hot.other_events.load(Ordering::Relaxed) as i64,
+    ];
+    core::ptr::copy_nonoverlapping(values.as_ptr(), out, values.len());
+    0
 }
