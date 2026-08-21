@@ -1,5 +1,4 @@
+# The Android linker is supplied by the build environment via
+# CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER so this file stays portable.
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
-
-[target.aarch64-linux-android]
-linker = "/home/hbartnick/Android/Sdk/ndk/30.0.14904198/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
