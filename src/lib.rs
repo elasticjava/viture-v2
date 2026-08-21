@@ -25,7 +25,7 @@ pub mod ring;
 pub mod sys;
 pub mod usbfs;
 pub mod xr;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod uring;
 
 /// Fixed report size of the device.

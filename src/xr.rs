@@ -51,6 +51,7 @@ pub struct XrState {
 #[derive(Default)]
 struct Hot {
     head: [AtomicU32; 4],
+    fresh: AtomicBool,
     gyro: [AtomicU32; 3],
     phone: [AtomicU32; 4],
     head_samples: AtomicU64,
@@ -88,11 +89,24 @@ struct Cold {
     lookahead_s: f32,
 }
 
+/// Device facts read once while the command path is still free, before the
+/// reader thread takes ownership of the transport. They change rarely; a
+/// renderer that wants live values can reopen.
+#[derive(Clone, Default)]
+pub struct DeviceInfo {
+    pub firmware: String,
+    pub brightness: i32,
+    pub volume: i32,
+    pub display_mode: i32,
+    pub worn: bool,
+}
+
 pub struct Tracker {
     hot: Arc<Hot>,
     cold: Mutex<Cold>,
     stop: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
+    info: DeviceInfo,
 }
 
 impl Tracker {
@@ -104,7 +118,24 @@ impl Tracker {
     /// allows both because the stream field is a bitmask.
     pub fn open(fd: i32, rate: Rate) -> crate::Result<Tracker> {
         let mut dev = Device::new(Usbfs::new(fd, 0)?);
-        dev.set_imu(Streams::POSE.with(Streams::RAW), rate)?;
+
+        // Read the static facts while nothing else is using the command path.
+        let mut buf = [0u8; 64];
+        let info = DeviceInfo {
+            firmware: dev.firmware_version(&mut buf).unwrap_or("unknown").to_owned(),
+            brightness: dev.brightness().map(i32::from).unwrap_or(-1),
+            volume: dev.volume().map(i32::from).unwrap_or(-1),
+            display_mode: dev.get_u8(crate::msg::DISPLAY_MODE).map(i32::from).unwrap_or(-1),
+            worn: dev.worn().unwrap_or(false),
+        };
+
+        // Both streams at once relies on the wire field being a bitmask. That
+        // is inferred, not documented, so fall back to pose only if the device
+        // refuses. Without raw the prediction simply has no rate to work with
+        // and becomes a no-op, which is safe.
+        if dev.set_imu(Streams::POSE.with(Streams::RAW), rate).is_err() {
+            dev.set_imu(Streams::POSE, rate)?;
+        }
 
         let hot = Arc::new(Hot::default());
         Hot::store_quat(&hot.head, [1.0, 0.0, 0.0, 0.0]);
@@ -122,7 +153,26 @@ impl Tracker {
             cold: Mutex::new(Cold { pointer: Pointer::default(), lookahead_s: 0.020 }),
             stop,
             reader: Some(reader),
+            info,
         })
+    }
+
+    pub fn info(&self) -> &DeviceInfo {
+        &self.info
+    }
+
+    /// Absolute head orientation as the vendor SDK reports it:
+    /// `[roll, pitch, yaw, qw, qx, qy, qz]`, Euler angles in degrees.
+    /// This is what a host that does its own recentring wants.
+    pub fn pose7(&self) -> [f32; 7] {
+        let q = Hot::load_quat(&self.hot.head);
+        let [roll, pitch, yaw] = crate::Pose { tick: 0, q }.euler_deg();
+        [roll, pitch, yaw, q[0], q[1], q[2], q[3]]
+    }
+
+    /// True once per new pose sample; clears the flag.
+    pub fn pose_fresh(&self) -> bool {
+        self.hot.fresh.swap(false, Ordering::Acquire)
     }
 
     /// Feeds the phone orientation, e.g. from `TYPE_GAME_ROTATION_VECTOR`.
@@ -199,6 +249,7 @@ fn read_loop<T: Transport>(mut dev: Device<T>, hot: Arc<Hot>, stop: Arc<AtomicBo
             Ok(Some(Event::Pose(p))) => {
                 Hot::store_quat(&hot.head, p.q);
                 hot.head_samples.fetch_add(1, Ordering::Relaxed);
+                hot.fresh.store(true, Ordering::Release);
             }
             Ok(Some(Event::Raw(r))) => {
                 for (a, v) in hot.gyro.iter().zip(r.gyro) {
@@ -345,4 +396,67 @@ mod tests {
         // The JNI shim copies this straight through, so no padding surprises.
         assert_eq!(core::mem::size_of::<XrState>(), 4 * 4 + 4 * 4 + 4 + 4 + 4 + 4 + 8 + 8);
     }
+}
+
+/// Fills `out` with `[roll, pitch, yaw, qw, qx, qy, qz]`, matching what the
+/// vendor SDK hands to its pose callback.
+///
+/// # Safety
+/// `t` must be live, `out` must hold seven floats.
+#[no_mangle]
+pub unsafe extern "C" fn xr_pose7(t: *mut Tracker, out: *mut f32) -> i32 {
+    match t.as_ref() {
+        Some(t) if !out.is_null() => {
+            core::ptr::copy_nonoverlapping(t.pose7().as_ptr(), out, 7);
+            0
+        }
+        _ => -1,
+    }
+}
+
+/// Non-zero once per new pose sample.
+///
+/// # Safety
+/// `t` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn xr_pose_fresh(t: *mut Tracker) -> i32 {
+    t.as_ref().map(|t| t.pose_fresh() as i32).unwrap_or(0)
+}
+
+/// # Safety
+/// `t` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn xr_brightness(t: *mut Tracker) -> i32 {
+    t.as_ref().map(|t| t.info.brightness).unwrap_or(-1)
+}
+
+/// # Safety
+/// `t` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn xr_volume(t: *mut Tracker) -> i32 {
+    t.as_ref().map(|t| t.info.volume).unwrap_or(-1)
+}
+
+/// # Safety
+/// `t` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn xr_display_mode(t: *mut Tracker) -> i32 {
+    t.as_ref().map(|t| t.info.display_mode).unwrap_or(-1)
+}
+
+/// Copies the firmware string into `out` as NUL-terminated ASCII.
+///
+/// # Safety
+/// `t` must be live, `out` must hold `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn xr_firmware(t: *mut Tracker, out: *mut u8, cap: usize) -> i32 {
+    let Some(t) = t.as_ref() else { return -1 };
+    if out.is_null() || cap == 0 {
+        return -1;
+    }
+    let bytes = t.info.firmware.as_bytes();
+    let n = bytes.len().min(cap - 1);
+    core::ptr::copy_nonoverlapping(bytes.as_ptr(), out, n);
+    *out.add(n) = 0;
+    n as i32
 }
