@@ -18,7 +18,7 @@ jobs:
     name: advisories, licences, sources
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Checks the RustSec advisory database, licence policy, banned crates and
       # that everything comes from crates.io. The crate has no dependencies
       # today, which is the point — this job keeps it that way.
@@ -31,7 +31,7 @@ jobs:
     name: unsafe surface
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       # This driver needs `unsafe` — raw syscalls, mmap, FFI. What it must not
       # do is grow that surface unnoticed, so the count is reported on every
@@ -54,7 +54,7 @@ jobs:
       security-events: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: github/codeql-action/init@v3
         with:
           languages: rust
