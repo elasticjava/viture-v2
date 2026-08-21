@@ -40,6 +40,7 @@ fn main() {
     };
 
     match cmd.as_str() {
+        "probe" => probe(),
         "info" => info(&mut Device::new(Hidraw::new(hid_fd()))),
         "pose" => run(&backend, Streams::POSE, secs, rate),
         "raw" => run(&backend, Streams::RAW, secs, rate),
@@ -78,6 +79,44 @@ fn report(label: &str, v: viture_v2::Result<u8>) {
     match v {
         Ok(v) => println!("{label:<14} {v}"),
         Err(e) => println!("{label:<14} — ({e})"),
+    }
+}
+
+/// Prüft die Syscall-Schicht und die Transportverfügbarkeit — ohne Gerät.
+/// Nützlich, um eine neue Plattform zu vermessen, bevor Hardware im Spiel ist.
+fn probe() {
+    println!("Architektur      {}", std::env::consts::ARCH);
+
+    // ppoll: stdin ohne Wartezeit abfragen. Der Aufruf muss zurückkehren,
+    // nicht das Ergebnis ist interessant.
+    match viture_v2::sys::wait_readable(0, 0) {
+        Ok(r) => println!("ppoll            ok (stdin lesbar: {r})"),
+        Err(e) => println!("ppoll            FEHLER: {e}"),
+    }
+
+    // io_uring: auf Android sperrt die App-Sandbox das per seccomp.
+    let mut params = [0u8; 120];
+    match unsafe { viture_v2::sys::io_uring_setup(8, params.as_mut_ptr()) } {
+        Ok(fd) => {
+            println!("io_uring_setup   ok (fd {fd})");
+            let _ = viture_v2::sys::close(fd);
+        }
+        Err(e) => println!("io_uring_setup   nicht verfügbar: {e}"),
+    }
+
+    match hidraw::find_fd(VID, PID_PRO2) {
+        Ok(fd) => {
+            println!("hidraw-Knoten    gefunden");
+            let _ = viture_v2::sys::close(fd);
+        }
+        Err(e) => println!("hidraw-Knoten    {e}"),
+    }
+    match usbfs::find_fd(VID, PID_PRO2) {
+        Ok(fd) => {
+            println!("usbfs-Knoten     gefunden");
+            let _ = viture_v2::sys::close(fd);
+        }
+        Err(e) => println!("usbfs-Knoten     {e}"),
     }
 }
 
