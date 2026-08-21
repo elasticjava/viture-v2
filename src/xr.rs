@@ -16,8 +16,11 @@
 //! xr_close(t);
 //! ```
 //!
-//! `xr_state` is the only call in the render loop. It reads atomics, does a
-//! prediction step and returns — no locks, no allocation, no syscall.
+//! `xr_state` is the only call in the render loop: it reads the hot values from
+//! atomics, does a prediction step and returns. No allocation and no syscall.
+//! It does take one uncontended mutex for the recentre reference and the
+//! look-ahead — those are written only when the user recentres or turns a knob,
+//! so the render loop never waits on it in practice.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
