@@ -1,0 +1,50 @@
+name: Dependabot automerge
+
+# Keeps the project moving without a human in the loop for the boring updates,
+# while still refusing to merge anything red: auto-merge waits for the required
+# status checks, and the branch protection makes CI required.
+#
+# Policy:
+#   * patch and minor  -> merged automatically
+#   * GitHub Actions   -> merged automatically even on major, because the CI run
+#                         on the PR is itself the proof that the action still
+#                         works here
+#   * cargo majors     -> left open on purpose; a major bump of something this
+#                         crate links deserves eyes
+
+on: pull_request_target
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read the update metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge
+        if: >
+          steps.meta.outputs.update-type != 'version-update:semver-major' ||
+          steps.meta.outputs.package-ecosystem == 'github_actions'
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Explain why a major was left alone
+        if: >
+          steps.meta.outputs.update-type == 'version-update:semver-major' &&
+          steps.meta.outputs.package-ecosystem != 'github_actions'
+        run: |
+          gh pr comment "$PR_URL" --body \
+            "Left for review: major update of \`${{ steps.meta.outputs.dependency-names }}\`. Auto-merge covers patch, minor and action bumps."
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
