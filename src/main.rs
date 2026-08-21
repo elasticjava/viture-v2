@@ -26,6 +26,13 @@ enum Sample {
 }
 
 fn main() {
+    // `termux-usb -r -e ./viture-v2 /dev/bus/usb/B/D` ruft uns mit dem
+    // Deskriptor als erstem Argument auf. Der ist nur für die Dauer dieses
+    // Prozesses gültig, also gleich hier abarbeiten.
+    if let Some(fd) = std::env::args().nth(1).and_then(|a| a.parse::<i32>().ok()) {
+        return termux(fd);
+    }
+
     let mut args = std::env::args().skip(1);
     let cmd = args.next().unwrap_or_else(|| "info".into());
     let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(5);
@@ -80,6 +87,41 @@ fn report(label: &str, v: viture_v2::Result<u8>) {
         Ok(v) => println!("{label:<14} {v}"),
         Err(e) => println!("{label:<14} — ({e})"),
     }
+}
+
+/// Einstieg für `termux-usb`: Deskriptor liegt bereits offen vor.
+fn termux(fd: i32) {
+    println!("termux-usb: Deskriptor {fd}");
+    let usb = match Usbfs::new(fd, 0) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("usbfs-Transport fehlgeschlagen: {e}");
+            std::process::exit(4);
+        }
+    };
+    let mut dev = Device::new(usb);
+
+    let mut buf = [0u8; 64];
+    match dev.firmware_version(&mut buf) {
+        Ok(v) => println!("Firmware       {v}"),
+        Err(e) => println!("Firmware       — ({e})"),
+    }
+    report("Helligkeit", dev.brightness());
+    match dev.display_mode() {
+        Ok(m) => println!("Anzeigemodus   {m:?}"),
+        Err(e) => println!("Anzeigemodus   — ({e})"),
+    }
+    match dev.worn() {
+        Ok(w) => println!("Getragen       {}", if w { "ja" } else { "nein" }),
+        Err(e) => println!("Getragen       — ({e})"),
+    }
+
+    let secs: u64 = std::env::var("VITURE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    println!("\n{secs} s Pose-Strom …");
+    pump(dev, Streams::POSE, secs, Rate::Hz120, |d| {
+        let s = d.transport_mut().stats;
+        format!("{} URB-Submits, {} Reaps, {} Wartezyklen", s.submits, s.reaps, s.waits)
+    });
 }
 
 /// Prüft die Syscall-Schicht und die Transportverfügbarkeit — ohne Gerät.

@@ -28,6 +28,17 @@ changing.
 | Setters (brightness, display mode, …) | not mapped yet |
 | Sensor fusion / prediction | not implemented |
 
+## Verified on
+
+| Host | Transport | Result |
+|---|---|---|
+| x86-64 Linux (glasses over USB/IP) | io_uring, hidraw, usbfs | pose 119 Hz, raw up to 795 Hz |
+| **Google Pixel 9, Android 17, Termux** | usbfs via `termux-usb` | pose 119 Hz, all queries correct, **no root** |
+
+The Android run reads the same firmware string, brightness and display mode as the desktop
+run, at the same rate. `io_uring_setup` returns `EPERM` on Android 17 even for the `shell`
+domain, so the usbfs transport is not a fallback there — it is the only option.
+
 ## Design
 
 Three interchangeable transports behind one trait, so the protocol core is written once:
