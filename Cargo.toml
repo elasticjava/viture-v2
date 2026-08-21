@@ -1,0 +1,15 @@
+[package]
+name = "viture-v2"
+version = "0.1.0"
+edition = "2021"
+description = "Dependency-free driver for VITURE Gen2 XR glasses (protocol V2), no vendor SDK"
+license = "MIT"
+
+[dependencies]
+# bewusst keine. Der Hot Path soll ohne Fremdcode auskommen.
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
