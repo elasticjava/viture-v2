@@ -171,13 +171,20 @@ impl Tracker {
             worn: dev.worn().unwrap_or(false),
         };
 
-        // Both streams at once relies on the wire field being a bitmask. That
-        // is inferred, not documented, so fall back to pose only if the device
-        // refuses. Without raw the prediction simply has no rate to work with
-        // and becomes a no-op, which is safe.
-        if dev.set_imu(Streams::POSE.with(Streams::RAW), rate).is_err() {
-            dev.set_imu(Streams::POSE, rate)?;
-        }
+        // Pose only by default. Running both streams at once relies on the wire
+        // field being a bitmask, which is inferred rather than documented — and
+        // the device accepts `3` with a success ACK and then sends nothing at
+        // all, so the error path never fires and tracking simply stays silent.
+        // That cost an afternoon; do not re-enable it without measuring.
+        //
+        // Set VITURE_STREAMS=raw or =both to experiment. Without raw the
+        // prediction has no angular rate and degrades to a no-op, which is safe.
+        let streams = match std::env::var("VITURE_STREAMS").as_deref() {
+            Ok("raw") => Streams::RAW,
+            Ok("both") => Streams::POSE.with(Streams::RAW),
+            _ => Streams::POSE,
+        };
+        dev.set_imu(streams, rate)?;
 
         let hot = Arc::new(Hot::default());
         Hot::store_quat(&hot.head, [1.0, 0.0, 0.0, 0.0]);
