@@ -5,6 +5,9 @@ edition = "2021"
 description = "Dependency-free driver for VITURE Gen2 XR glasses (protocol V2), no vendor SDK"
 license = "MIT"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 # bewusst keine. Der Hot Path soll ohne Fremdcode auskommen.
 

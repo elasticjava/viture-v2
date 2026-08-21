@@ -24,6 +24,7 @@ pub mod pointer;
 pub mod ring;
 pub mod sys;
 pub mod usbfs;
+pub mod xr;
 #[cfg(target_os = "linux")]
 pub mod uring;
 
