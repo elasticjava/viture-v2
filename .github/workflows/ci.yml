@@ -32,10 +32,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features
-      - run: cargo test --release --all-features
+      - run: cargo test --profile release-test --all-features
       # The default feature set has to stay dependency-free — the driver's
       # hot path is the whole point of the crate.
-      - run: cargo test --release --no-default-features
+      - run: cargo test --profile release-test --no-default-features
       - name: No dependencies without the render feature
         run: |
           set -euo pipefail

@@ -36,4 +36,16 @@ serde_json = "1"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+# The driver aborts rather than unwinding: it is a shared library loaded into
+# someone else's process, and unwinding across that boundary is undefined.
 panic = "abort"
+
+# Optimised, but unwinding, so tests can run against the code that ships.
+#
+# `cargo test --release` cannot: a test harness has to unwind to report a
+# failure, and it would be linking dependencies built to abort. Dropping to a
+# debug build instead would leave the optimiser untested, and the maths here is
+# the kind that opt-level and lto can change.
+[profile.release-test]
+inherits = "release"
+panic = "unwind"
