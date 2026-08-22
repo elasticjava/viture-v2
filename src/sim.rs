@@ -118,6 +118,8 @@ pub struct Simulated {
     stalled: bool,
     /// Whether to spend real time between samples.
     paced: bool,
+    /// When the first paced sample went out, so simulated and real time agree.
+    started: Option<std::time::Instant>,
     /// Every command the driver sent, for asserting on.
     pub sent: Vec<(u16, Vec<u8>)>,
 }
@@ -131,6 +133,7 @@ impl Simulated {
             replies: Vec::new(),
             stalled: false,
             paced: false,
+            started: None,
             sent: Vec::new(),
         }
     }
@@ -174,9 +177,20 @@ impl Simulated {
         1.0 / self.state.rate.hz() as f32
     }
 
-    /// How far the simulated clock has advanced.
+    /// How far the clock has advanced.
+    ///
+    /// Counted in samples when running free, and read from the real clock when
+    /// paced. The difference matters: paced mode exists because the code under
+    /// test measures elapsed time, and if the trajectory advanced by a fixed
+    /// step while the driver measured a longer real interval — which is what a
+    /// loaded machine produces — the rate it computed would come out too low
+    /// through no fault of its own. Taking both from the same clock makes an
+    /// overrun harmless.
     pub fn elapsed(&self) -> f32 {
-        self.tick as f32 * self.interval()
+        match self.started {
+            Some(start) => start.elapsed().as_secs_f32(),
+            None => self.tick as f32 * self.interval(),
+        }
     }
 
     fn reply(&mut self, msg_id: u16, payload: &[u8]) {
@@ -278,6 +292,9 @@ impl Transport for Simulated {
         }
 
         if self.paced {
+            if self.started.is_none() {
+                self.started = Some(std::time::Instant::now());
+            }
             std::thread::sleep(std::time::Duration::from_secs_f32(self.interval()));
         }
         let event = self.pose_event();

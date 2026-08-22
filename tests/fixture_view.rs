@@ -120,9 +120,15 @@ fn the_two_eyes_differ_exactly_where_the_packing_says_they_should() {
         let right = centre_uv(projection, layout, Eye::Right);
 
         match packing {
-            0 => assert_eq!(left, right, "{name}: a monoscopic frame reached the eyes split"),
+            0 => assert_eq!(
+                left, right,
+                "{name}: a monoscopic frame reached the eyes split"
+            ),
             1 => {
-                assert!((left[0] - right[0]).abs() < 1e-4, "{name}: split horizontally");
+                assert!(
+                    (left[0] - right[0]).abs() < 1e-4,
+                    "{name}: split horizontally"
+                );
                 assert!(
                     (left[1] - right[1] - 0.5).abs() < 1e-4,
                     "{name}: the halves are {} apart, expected 0.5 with the left eye above",
@@ -130,7 +136,10 @@ fn the_two_eyes_differ_exactly_where_the_packing_says_they_should() {
                 );
             }
             2 => {
-                assert!((left[1] - right[1]).abs() < 1e-4, "{name}: split vertically");
+                assert!(
+                    (left[1] - right[1]).abs() < 1e-4,
+                    "{name}: split vertically"
+                );
                 assert!(
                     (right[0] - left[0] - 0.5).abs() < 1e-4,
                     "{name}: the halves are {} apart, expected 0.5 with the left eye first",
@@ -157,6 +166,14 @@ fn the_fixture_covers_both_projections_and_all_three_packings() {
         .iter()
         .map(|s| s["expect"]["projection"].as_u64().unwrap())
         .collect();
-    assert_eq!(packings, [0, 1, 2].into_iter().collect(), "packings covered");
-    assert_eq!(projections, [0, 1].into_iter().collect(), "projections covered");
+    assert_eq!(
+        packings,
+        [0, 1, 2].into_iter().collect(),
+        "packings covered"
+    );
+    assert_eq!(
+        projections,
+        [0, 1].into_iter().collect(),
+        "projections covered"
+    );
 }
