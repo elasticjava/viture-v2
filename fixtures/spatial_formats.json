@@ -4,18 +4,33 @@
     "",
     "Each entry describes what a media centre reports about a file, what the",
     "library should conclude from it, and what the wearer should then see. The",
-    "two ends are tested in different languages and different processes — the",
-    "Kotlin side asserts the first half, the Rust side the second — so this file",
+    "two ends are tested in different languages and different processes \u2014 the",
+    "Kotlin side asserts the first half, the Rust side the second \u2014 so this file",
     "is what keeps them agreeing. Change one side's behaviour and the other",
     "side's test fails, which is the point.",
     "",
-    "packing:    0 monoscopic, 1 over-under, 2 side-by-side",
-    "projection: 0 full sphere, 1 VR180 front hemisphere, 2 a flat screen",
+    "packing:    0 monoscopic, 1 over-under, 2 side-by-side, 3 anaglyph,",
+    "            4 row-interleaved",
+    "projection: 0 full sphere, 1 VR180 front hemisphere, 2 a flat screen,",
+    "            3 a cube map",
+    "swapEyes:   the eyes are the other way round from what the packing implies",
+    "            \u2014 the right_left, bottom_top and _rl variants",
+    "anaglyphPair: 0 cyan/red, 1 green/magenta, 2 yellow/blue; only meaningful",
+    "            for an anaglyph packing",
     "verdict:    GUESSED weakest, then CATALOGUED, DECLARED, CHOSEN",
     "centreUv:   what the middle of the panel samples, per eye, looking straight",
     "            ahead. Exact, because the middle of an equirectangular image is",
     "            straight ahead by definition and the stereo window is a fixed",
-    "            transform on top."
+    "            transform on top.",
+    "",
+    "            Two packings have no window: anaglyph and row-interleaved cover",
+    "            the whole frame with both eyes and separate them per pixel, in",
+    "            the fragment shader. Their centreUv is therefore the same for",
+    "            both eyes, and that is a statement about where the geometry",
+    "            samples, not a claim that the eyes see the same thing.",
+    "            Where swapEyes is set, centreUv is what each eye actually",
+    "            sees \u2014 already swapped. That is the whole content of the flag,",
+    "            so stating it any other way would test nothing."
   ],
   "scenarios": [
     {
@@ -163,17 +178,18 @@
       }
     },
     {
-      "name": "a stereo mode nothing can split falls back to inference",
+      "name": "an anaglyph film, whose eyes share every pixel",
       "kodi": {
         "label": "Documentary",
-        "width": 3840,
-        "height": 1920,
+        "width": 1920,
+        "height": 1080,
         "stereomode": "anaglyph_cyan_red"
       },
       "expect": {
-        "packing": 0,
-        "projection": 0,
-        "verdict": "GUESSED"
+        "packing": 3,
+        "projection": 2,
+        "verdict": "CATALOGUED",
+        "anaglyphPair": 0
       },
       "centreUv": {
         "left": [
@@ -294,6 +310,154 @@
         "packing": 0,
         "projection": 2,
         "verdict": "CATALOGUED"
+      },
+      "centreUv": {
+        "left": [
+          0.5,
+          0.5
+        ],
+        "right": [
+          0.5,
+          0.5
+        ]
+      }
+    },
+    {
+      "name": "a green/magenta anaglyph names a different pair of channels",
+      "kodi": {
+        "label": "Creature",
+        "width": 1920,
+        "height": 1080,
+        "stereomode": "anaglyph_green_magenta"
+      },
+      "expect": {
+        "packing": 3,
+        "projection": 2,
+        "verdict": "CATALOGUED",
+        "anaglyphPair": 1
+      },
+      "centreUv": {
+        "left": [
+          0.5,
+          0.5
+        ],
+        "right": [
+          0.5,
+          0.5
+        ]
+      }
+    },
+    {
+      "name": "a row-interleaved sphere, whose eyes alternate by line",
+      "kodi": {
+        "label": "Reef",
+        "width": 3840,
+        "height": 3840,
+        "stereomode": "row_interleaved_lr"
+      },
+      "expect": {
+        "packing": 4,
+        "projection": 0,
+        "verdict": "CATALOGUED"
+      },
+      "centreUv": {
+        "left": [
+          0.5,
+          0.5
+        ],
+        "right": [
+          0.5,
+          0.5
+        ]
+      }
+    },
+    {
+      "name": "a row-interleaved 3D television film is still a screen",
+      "kodi": {
+        "label": "Gravity",
+        "width": 1920,
+        "height": 1080,
+        "stereomode": "row_interleaved_rl"
+      },
+      "expect": {
+        "packing": 4,
+        "projection": 2,
+        "verdict": "CATALOGUED",
+        "swapEyes": true
+      },
+      "centreUv": {
+        "left": [
+          0.5,
+          0.5
+        ],
+        "right": [
+          0.5,
+          0.5
+        ]
+      }
+    },
+    {
+      "name": "a reversed side-by-side film is a swap, not a packing",
+      "kodi": {
+        "label": "Gravity 3D RL",
+        "width": 3840,
+        "height": 1080,
+        "stereomode": "right_left"
+      },
+      "expect": {
+        "packing": 2,
+        "projection": 2,
+        "verdict": "CATALOGUED",
+        "swapEyes": true
+      },
+      "centreUv": {
+        "left": [
+          0.75,
+          0.5
+        ],
+        "right": [
+          0.25,
+          0.5
+        ]
+      }
+    },
+    {
+      "name": "a bottom-top film stacks its eyes the other way up",
+      "kodi": {
+        "label": "Dive BT",
+        "width": 3840,
+        "height": 3840,
+        "stereomode": "bottom_top"
+      },
+      "expect": {
+        "packing": 1,
+        "projection": 0,
+        "verdict": "CATALOGUED",
+        "swapEyes": true
+      },
+      "centreUv": {
+        "left": [
+          0.5,
+          0.25
+        ],
+        "right": [
+          0.5,
+          0.75
+        ]
+      }
+    },
+    {
+      "name": "a checkerboard mode nothing here can split falls back",
+      "kodi": {
+        "label": "Oddity",
+        "width": 3840,
+        "height": 1920,
+        "stereomode": "checkerboard_lr"
+      },
+      "expect": {
+        "packing": 0,
+        "projection": 0,
+        "verdict": "GUESSED"
       },
       "centreUv": {
         "left": [

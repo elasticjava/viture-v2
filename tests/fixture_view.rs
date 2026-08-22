@@ -22,10 +22,18 @@ use viture_v2::pano::{
 const RINGS: u32 = 64;
 const SECTORS: u32 = 128;
 
+/// Where the shared fixture lives.
+///
+/// The build directory by default, and whatever `XR_FIXTURES` says when it is
+/// set. The override exists so this can be cross-compiled and run on the phone:
+/// `CARGO_MANIFEST_DIR` is baked in at compile time and names a directory that
+/// does not exist there, and the one test that pins the two languages together
+/// is worth being able to run on the machine that has to agree.
 fn fixture() -> serde_json::Value {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures")
-        .join("spatial_formats.json");
+    let root = std::env::var_os("XR_FIXTURES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures"));
+    let path = root.join("spatial_formats.json");
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     serde_json::from_str(&text).expect("the fixture should be valid JSON")
@@ -37,7 +45,15 @@ fn fixture() -> serde_json::Value {
 /// interpolated across the triangle the point falls in rather than snapped to
 /// the nearest vertex — a screen has two rows, so its nearest vertex is always
 /// an edge and never the middle of the picture.
-fn centre_uv(projection: Projection, layout: StereoLayout, eye: Eye) -> [f32; 2] {
+fn centre_uv(projection: Projection, layout: StereoLayout, eye: Eye, swap: bool) -> [f32; 2] {
+    // Which eye's picture this eye is shown, which is not the same question as
+    // which eye is being drawn. A `right_left` file packs them the other way
+    // round, and the renderer answers it in exactly this place.
+    let eye = match (swap, eye) {
+        (true, Eye::Left) => Eye::Right,
+        (true, Eye::Right) => Eye::Left,
+        (false, e) => e,
+    };
     // The eye offset is left at zero even for a screen: what is being isolated
     // here is the stereo window, and a displaced camera would move the sampled
     // point for a reason that has nothing to do with it.
@@ -143,6 +159,7 @@ fn every_scenario_puts_the_right_half_of_the_frame_in_front_of_each_eye() {
         let layout = layout_of(expect["packing"].as_u64().expect("packing"));
         let projection = projection_of(expect["projection"].as_u64().expect("projection"));
 
+        let swap = scenario["expect"]["swapEyes"].as_bool().unwrap_or(false);
         for (eye, key) in [(Eye::Left, "left"), (Eye::Right, "right")] {
             let expected = scenario["centreUv"][key]
                 .as_array()
@@ -151,7 +168,7 @@ fn every_scenario_puts_the_right_half_of_the_frame_in_front_of_each_eye() {
                 expected[0].as_f64().unwrap() as f32,
                 expected[1].as_f64().unwrap() as f32,
             ];
-            let got = centre_uv(projection, layout, eye);
+            let got = centre_uv(projection, layout, eye, swap);
             // Interpolated across the triangle, so this is exact up to the
             // mesh's own faceting: a sphere approximated by flat quads is a
             // fraction of a cell away from the ideal surface.
@@ -176,8 +193,12 @@ fn the_two_eyes_differ_exactly_where_the_packing_says_they_should() {
         let projection = projection_of(scenario["expect"]["projection"].as_u64().unwrap());
         let layout = layout_of(packing);
 
-        let left = centre_uv(projection, layout, Eye::Left);
-        let right = centre_uv(projection, layout, Eye::Right);
+        let swap = scenario["expect"]["swapEyes"].as_bool().unwrap_or(false);
+        let left = centre_uv(projection, layout, Eye::Left, swap);
+        let right = centre_uv(projection, layout, Eye::Right, swap);
+        // A swap exchanges the two halves and nothing else, so the assertions
+        // below hold with the eyes put back the way the packing means them.
+        let (left, right) = if swap { (right, left) } else { (left, right) };
 
         match packing {
             0 => assert_eq!(
@@ -206,6 +227,15 @@ fn the_two_eyes_differ_exactly_where_the_packing_says_they_should() {
                     right[0] - left[0],
                 );
             }
+            // Anaglyph and row-interleaved cover the whole frame with both
+            // eyes and separate them per pixel, in the fragment shader. There
+            // is no window to be wrong about, and asserting that the geometry
+            // samples the same place for both is the true statement — not a
+            // claim that the eyes see the same thing.
+            3 | 4 => assert_eq!(
+                left, right,
+                "{name}: a packing with no window sampled two different places"
+            ),
             other => panic!("{name}: unknown packing {other}"),
         }
     }
@@ -228,7 +258,7 @@ fn the_fixture_covers_both_projections_and_all_three_packings() {
         .collect();
     assert_eq!(
         packings,
-        [0, 1, 2].into_iter().collect(),
+        [0, 1, 2, 3, 4].into_iter().collect(),
         "packings covered"
     );
     assert_eq!(
@@ -236,4 +266,11 @@ fn the_fixture_covers_both_projections_and_all_three_packings() {
         [0, 1, 2].into_iter().collect(),
         "projections covered"
     );
+    // And both settings of the swap, which is a separate axis from the packing
+    // and the one most easily left untested.
+    let swaps: std::collections::BTreeSet<bool> = scenarios
+        .iter()
+        .map(|s| s["expect"]["swapEyes"].as_bool().unwrap_or(false))
+        .collect();
+    assert_eq!(swaps, [false, true].into_iter().collect(), "swaps covered");
 }

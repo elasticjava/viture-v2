@@ -26,7 +26,7 @@
 //! reimplementation against the same format, kept deliberately close to it so
 //! the two can be compared.
 
-use crate::pano::VERTEX_FLOATS;
+use crate::pano::{Bounds, VERTEX_FLOATS};
 
 /// Triangle layout of a sub-mesh, matching the values in the file.
 pub mod draw_mode {
@@ -75,8 +75,35 @@ impl Projection {
     }
 }
 
+/// What a `proj` box turned out to say.
+///
+/// The three are alternatives in the format and alternatives here. A file
+/// carries exactly one of them, and which one decides what geometry is built —
+/// so this is the one place the question is answered, rather than three
+/// half-answers spread across the renderer.
+pub enum Spherical {
+    /// An equirectangular image over the stated patch of the sphere.
+    ///
+    /// The bounds come from the `equi` box, which every conforming spherical
+    /// file has even when it covers everything — in which case they are all
+    /// zero and this is a plain 360 video.
+    Equirect(Bounds),
+    /// Six cube faces packed into one frame.
+    Cubemap {
+        /// 0 is the only layout defined: a 3x2 grid.
+        layout: u32,
+        /// Pixels of padding around each face, which the renderer must trim or
+        /// the filtering will drag one face's texels onto the next.
+        padding: u32,
+    },
+    /// Geometry the file carries itself, for lenses no formula describes.
+    Mesh(Projection),
+}
+
 // Box types, as big-endian FourCCs.
 const TYPE_PROJ: u32 = u32::from_be_bytes(*b"proj");
+const TYPE_EQUI: u32 = u32::from_be_bytes(*b"equi");
+const TYPE_CBMP: u32 = u32::from_be_bytes(*b"cbmp");
 const TYPE_MSHP: u32 = u32::from_be_bytes(*b"mshp");
 const TYPE_YTMP: u32 = u32::from_be_bytes(*b"ytmp");
 const TYPE_MESH: u32 = u32::from_be_bytes(*b"mesh");
@@ -89,6 +116,11 @@ const MAX_COORDINATES: u32 = 10_000;
 const MAX_VERTICES: u32 = 32_000;
 const MAX_TRIANGLE_INDICES: u32 = 128_000;
 
+/// Padding, in pixels, beyond which a `cbmp` box is not describing a frame any
+/// display will ever carry — a face of an 8K cube map is under 3000 pixels
+/// across, so this is already generous.
+const MAX_CUBE_PADDING: u32 = 4096;
+
 /// Ceiling on the inflated size of a deflated mesh, so a small box cannot
 /// expand into an arbitrarily large allocation.
 const MAX_INFLATED_BYTES: usize = 16 << 20;
@@ -96,10 +128,10 @@ const MAX_INFLATED_BYTES: usize = 16 << 20;
 /// Parses the contents of a `proj` box — what ExoPlayer hands over as
 /// `Format.projectionData`, header included.
 ///
-/// Returns `None` for anything malformed rather than a partial mesh: half a
+/// Returns `None` for anything malformed rather than a partial answer: half a
 /// projection renders as a torn hole in the world, which is worse than falling
 /// back to a sphere.
-pub fn parse_projection(data: &[u8]) -> Option<Projection> {
+pub fn parse_spherical(data: &[u8]) -> Option<Spherical> {
     let mut r = Reader::new(data);
     // The box's own size field is not needed; the slice bounds it.
     r.skip(4)?;
@@ -115,16 +147,75 @@ pub fn parse_projection(data: &[u8]) -> Option<Projection> {
         if size < 8 || end > data.len() {
             return None;
         }
-        if child_type == TYPE_MSHP || child_type == TYPE_YTMP {
-            let meshes = parse_mshp(&data[r.position()..end])?;
-            if meshes.is_empty() {
-                return None;
+        let body = &data[r.position()..end];
+        match child_type {
+            TYPE_MSHP | TYPE_YTMP => {
+                let meshes = parse_mshp(body)?;
+                if meshes.is_empty() {
+                    return None;
+                }
+                return Some(Spherical::Mesh(Projection { meshes }));
             }
-            return Some(Projection { meshes });
+            TYPE_EQUI => return parse_equi(body).map(Spherical::Equirect),
+            TYPE_CBMP => return parse_cbmp(body),
+            // `prhd`, and anything a later revision adds.
+            _ => {}
         }
         r.seek(end)?;
     }
     None
+}
+
+/// The mesh, if that is what the box holds. Kept for the callers that can only
+/// use geometry and fall back to a sphere for everything else.
+pub fn parse_projection(data: &[u8]) -> Option<Projection> {
+    match parse_spherical(data)? {
+        Spherical::Mesh(p) => Some(p),
+        _ => None,
+    }
+}
+
+/// The `equi` payload: a full-box header, then how much of the sphere is
+/// missing from each edge.
+///
+/// The four values are 0.32 fixed point — the whole 32 bits are fraction, so
+/// the range is `[0, 1)` and the unit is the whole sphere. All zero is an
+/// ordinary 360 video, and that is what a conforming file writes when it covers
+/// everything; the values only become interesting for footage that does not,
+/// which until now was stretched over whichever preset was nearest.
+fn parse_equi(data: &[u8]) -> Option<Bounds> {
+    let mut r = Reader::new(data);
+    if r.u8()? != 0 {
+        return None;
+    }
+    r.skip(3)?; // flags
+    let scale = |v: u32| v as f32 / 4_294_967_296.0;
+    let bounds = Bounds {
+        top: scale(r.u32()?),
+        bottom: scale(r.u32()?),
+        left: scale(r.u32()?),
+        right: scale(r.u32()?),
+    };
+    // A file claiming to have cropped away a whole dimension has nothing to
+    // show, and would divide the mesh by zero.
+    bounds.is_usable().then_some(bounds)
+}
+
+/// The `cbmp` payload: a full-box header, the grid layout, and the padding.
+fn parse_cbmp(data: &[u8]) -> Option<Spherical> {
+    let mut r = Reader::new(data);
+    if r.u8()? != 0 {
+        return None;
+    }
+    r.skip(3)?; // flags
+    let layout = r.u32()?;
+    let padding = r.u32()?;
+    // Layout 0 is the only one defined, and a cube face cannot be more than
+    // half padding.
+    if layout != 0 || padding > MAX_CUBE_PADDING {
+        return None;
+    }
+    Some(Spherical::Cubemap { layout, padding })
 }
 
 /// The `mshp` payload: a header, then mesh boxes, optionally deflated.
@@ -343,6 +434,42 @@ impl<'a> BitReader<'a> {
 // parse, ask how much there is, copy into buffers the caller owns, free. Four
 // calls per video, none of them per frame.
 // ---------------------------------------------------------------------------
+
+/// What a `proj` box says, without building anything: 0 equirectangular,
+/// 1 cube map, 2 a carried mesh, -1 for absent or malformed.
+///
+/// `out` receives four floats whose meaning follows the return value:
+/// `[top, bottom, left, right]` bounds for equirectangular, `[layout, padding,
+/// 0, 0]` for a cube map, zeroes for a mesh. The mesh itself still comes from
+/// [`xr_mesh_parse`] — this is the cheap question the renderer asks first, once
+/// per video, to decide which of the three it is about to draw.
+///
+/// # Safety
+/// `data` must point to `len` readable bytes and `out` to four writable,
+/// aligned `f32`s.
+#[no_mangle]
+pub unsafe extern "C" fn xr_proj_kind(data: *const u8, len: usize, out: *mut f32) -> i32 {
+    if data.is_null() || len == 0 || out.is_null() {
+        return -1;
+    }
+    let bytes = std::slice::from_raw_parts(data, len);
+    let slice = std::slice::from_raw_parts_mut(out, 4);
+    match parse_spherical(bytes) {
+        Some(Spherical::Equirect(b)) => {
+            slice.copy_from_slice(&[b.top, b.bottom, b.left, b.right]);
+            0
+        }
+        Some(Spherical::Cubemap { layout, padding }) => {
+            slice.copy_from_slice(&[layout as f32, padding as f32, 0.0, 0.0]);
+            1
+        }
+        Some(Spherical::Mesh(_)) => {
+            slice.fill(0.0);
+            2
+        }
+        None => -1,
+    }
+}
 
 /// Parses a `proj` box. Returns a handle to free with [`xr_mesh_free`], or null
 /// if the box is absent, malformed or in a form this does not read.
@@ -692,5 +819,122 @@ mod tests {
         let mut reader = BitReader::new(&writer.bytes, 0);
         assert_eq!(reader.read(3), Some(0b101));
         assert_eq!(reader.read(4), Some(0b1100));
+    }
+
+    // -- the projections that are not meshes ---------------------------------
+
+    /// A `proj` box wrapping the given children.
+    fn proj(children: &[Vec<u8>]) -> Vec<u8> {
+        boxed(b"proj", &children.concat())
+    }
+
+    /// A `prhd` box, which every conforming file carries and nothing here
+    /// reads: pose yaw, pitch and roll as 16.16 fixed point.
+    fn prhd() -> Vec<u8> {
+        boxed(b"prhd", &[0u8; 4 + 12])
+    }
+
+    /// An `equi` box, from four fractions of the sphere.
+    fn equi(top: f64, bottom: f64, left: f64, right: f64) -> Vec<u8> {
+        let mut payload = vec![0u8; 4]; // version and flags
+        for value in [top, bottom, left, right] {
+            let fixed = (value * 4_294_967_296.0) as u32;
+            payload.extend_from_slice(&fixed.to_be_bytes());
+        }
+        boxed(b"equi", &payload)
+    }
+
+    fn cbmp(layout: u32, padding: u32) -> Vec<u8> {
+        let mut payload = vec![0u8; 4];
+        payload.extend_from_slice(&layout.to_be_bytes());
+        payload.extend_from_slice(&padding.to_be_bytes());
+        boxed(b"cbmp", &payload)
+    }
+
+    #[test]
+    fn an_uncropped_equi_box_is_a_plain_full_sphere() {
+        // What a conforming 360 file actually writes: the box is present and
+        // every bound is zero. Reading that as anything but a full sphere would
+        // break the common case in the name of the rare one.
+        let data = proj(&[prhd(), equi(0.0, 0.0, 0.0, 0.0)]);
+        match parse_spherical(&data) {
+            Some(Spherical::Equirect(b)) => assert_eq!(b, Bounds::FULL),
+            _ => panic!("not read as a full sphere"),
+        }
+    }
+
+    #[test]
+    fn equi_bounds_come_back_as_the_fractions_they_encode() {
+        // 0.32 fixed point: the whole word is fraction, so a quarter is a
+        // quarter of the sphere. A file cropped a quarter from each side is a
+        // hemisphere, which is what VR180 is — and it says so this way rather
+        // than by being named.
+        let data = proj(&[prhd(), equi(0.0, 0.0, 0.25, 0.25)]);
+        let Some(Spherical::Equirect(bounds)) = parse_spherical(&data) else {
+            panic!("not equirectangular");
+        };
+        assert!((bounds.left - 0.25).abs() < 1e-6);
+        assert!((bounds.right - 0.25).abs() < 1e-6);
+        assert_eq!(
+            bounds,
+            crate::pano::Projection::Equirect180.bounds().unwrap()
+        );
+
+        // And an asymmetric crop survives as itself.
+        let data = proj(&[equi(0.125, 0.0625, 0.0, 0.5)]);
+        let Some(Spherical::Equirect(bounds)) = parse_spherical(&data) else {
+            panic!("not equirectangular");
+        };
+        assert!((bounds.top - 0.125).abs() < 1e-6);
+        assert!((bounds.bottom - 0.0625).abs() < 1e-6);
+        assert!((bounds.right - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_equi_box_that_crops_everything_away_is_refused() {
+        // Half from the top and half from the bottom leaves a sphere of zero
+        // height, which would divide the mesh by nothing.
+        assert!(parse_spherical(&proj(&[equi(0.5, 0.5, 0.0, 0.0)])).is_none());
+        assert!(parse_spherical(&proj(&[equi(0.0, 0.0, 0.75, 0.5)])).is_none());
+    }
+
+    #[test]
+    fn a_cbmp_box_reads_its_layout_and_padding() {
+        let Some(Spherical::Cubemap { layout, padding }) =
+            parse_spherical(&proj(&[prhd(), cbmp(0, 8)]))
+        else {
+            panic!("not a cube map");
+        };
+        assert_eq!((layout, padding), (0, 8));
+
+        // Layout 0 is the only one defined; guessing at another would draw the
+        // faces in the wrong places, which is worse than falling back.
+        assert!(parse_spherical(&proj(&[cbmp(1, 0)])).is_none());
+        assert!(parse_spherical(&proj(&[cbmp(0, 100_000)])).is_none());
+    }
+
+    #[test]
+    fn a_truncated_projection_box_yields_nothing() {
+        // Files get cut off mid-download, and half a projection renders as a
+        // hole in the world.
+        let full = proj(&[prhd(), equi(0.0, 0.0, 0.25, 0.25)]);
+        for cut in 1..full.len() {
+            let _ = parse_spherical(&full[..cut]);
+        }
+        // A child claiming to be longer than the box that holds it.
+        let mut lying = proj(&[equi(0.0, 0.0, 0.0, 0.0)]);
+        let child = 8;
+        lying[child..child + 4].copy_from_slice(&9999u32.to_be_bytes());
+        assert!(parse_spherical(&lying).is_none());
+    }
+
+    #[test]
+    fn the_mesh_path_still_only_answers_for_meshes() {
+        // `parse_projection` is what the geometry callers use, and an
+        // equirectangular file must not come back from it looking like a mesh
+        // of no triangles.
+        let data = proj(&[equi(0.0, 0.0, 0.0, 0.0)]);
+        assert!(parse_projection(&data).is_none());
+        assert!(parse_spherical(&data).is_some());
     }
 }

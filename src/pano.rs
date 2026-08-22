@@ -51,6 +51,21 @@ pub enum StereoLayout {
     OverUnder = 1,
     /// Left eye in the left half, right eye in the right.
     SideBySide = 2,
+    /// Both eyes in every pixel, separated by colour.
+    ///
+    /// Made for cardboard glasses with two coloured filters, and hostile to any
+    /// other display: each eye's picture survives only in the channels its
+    /// filter passes, so the colour is gone and only the brightness is left.
+    /// Shown as-is on a panel it is a red-and-blue smear. Recovering a grey
+    /// picture per eye is the most the frame contains, and it is worth doing —
+    /// the alternative is that a whole class of old 3D files plays unwatchably.
+    Anaglyph = 3,
+    /// Eyes on alternating rows of the frame.
+    ///
+    /// What passive polarised televisions want, and unlike the other packings
+    /// its two halves are interleaved rather than adjacent, so no rectangle of
+    /// texture is one eye's picture. It has to be resolved per pixel.
+    RowInterleaved = 4,
 }
 
 impl StereoLayout {
@@ -58,8 +73,72 @@ impl StereoLayout {
         match v {
             1 => StereoLayout::OverUnder,
             2 => StereoLayout::SideBySide,
+            3 => StereoLayout::Anaglyph,
+            4 => StereoLayout::RowInterleaved,
             _ => StereoLayout::Mono,
         }
+    }
+
+    /// Whether each eye's picture is a rectangle of the frame, which is what
+    /// [`uv_window`] can express on its own.
+    ///
+    /// The two that are not need the fragment shader: one separates the eyes by
+    /// colour and the other by row, and neither is a window.
+    pub fn is_windowed(self) -> bool {
+        !matches!(self, StereoLayout::Anaglyph | StereoLayout::RowInterleaved)
+    }
+}
+
+/// Which pair of complementary colours an anaglyph frame was encoded for.
+///
+/// Named left eye first, and that is a claim about the pixels rather than a
+/// repetition of what the container calls it. Matroska names the red/cyan one
+/// "anaglyph (cyan/red)", which read as left-then-right says the left eye is in
+/// the green and blue channels — and it is not. Encoders put the left eye in
+/// red, because red-cyan glasses are worn with the red lens over the left eye,
+/// and that is what the files contain: an anaglyph made by `ffmpeg -vf
+/// stereo3d=sbsl:arcg` has its left view in the red channel, checked rather
+/// than assumed.
+///
+/// So the container's label is mapped onto these, not copied into them, and a
+/// file that turns out to be the other way round is handled by swapping the
+/// eyes — which is something the viewer can see and decide.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum AnaglyphPair {
+    /// Left eye red, right eye cyan. What Matroska labels "cyan/red".
+    RedCyan = 0,
+    /// Left eye green, right eye magenta.
+    GreenMagenta = 1,
+    /// Left eye yellow, right eye blue.
+    YellowBlue = 2,
+}
+
+impl AnaglyphPair {
+    pub fn from_raw(v: u32) -> AnaglyphPair {
+        match v {
+            1 => AnaglyphPair::GreenMagenta,
+            2 => AnaglyphPair::YellowBlue,
+            _ => AnaglyphPair::RedCyan,
+        }
+    }
+}
+
+/// How much of each colour channel carries one eye's picture.
+///
+/// The weights sum to one, so a grey frame comes back at its own brightness
+/// rather than darkened or blown out. A filter that passes two channels gets
+/// half of each: both hold the same eye's image, and averaging them is a free
+/// halving of the encoder's chroma noise.
+pub fn anaglyph_mix(pair: AnaglyphPair, eye: Eye) -> [f32; 3] {
+    let left = eye == Eye::Left;
+    match (pair, left) {
+        (AnaglyphPair::RedCyan, true) => [1.0, 0.0, 0.0],
+        (AnaglyphPair::RedCyan, false) => [0.0, 0.5, 0.5],
+        (AnaglyphPair::GreenMagenta, true) => [0.0, 1.0, 0.0],
+        (AnaglyphPair::GreenMagenta, false) => [0.5, 0.0, 0.5],
+        (AnaglyphPair::YellowBlue, true) => [0.5, 0.5, 0.0],
+        (AnaglyphPair::YellowBlue, false) => [0.0, 0.0, 1.0],
     }
 }
 
@@ -81,6 +160,12 @@ pub enum Projection {
     /// hemisphere is built, so turning round shows the background rather than
     /// the footage smeared across geometry it was never meant to cover.
     Equirect180 = 1,
+    /// Six faces of a cube, as a 3x2 grid in one frame.
+    ///
+    /// The `cbmp` box's layout 0. Cube mapping spends its pixels far more evenly
+    /// than an equirectangular image, which crowds them at the poles and starves
+    /// the horizon — the part anyone actually looks at.
+    Cubemap = 3,
     /// Not a panorama at all: an ordinary rectangular picture, shown on a screen
     /// standing in the room.
     ///
@@ -97,6 +182,7 @@ impl Projection {
         match v {
             1 => Projection::Equirect180,
             2 => Projection::Flat,
+            3 => Projection::Cubemap,
             _ => Projection::Equirect360,
         }
     }
@@ -106,12 +192,18 @@ impl Projection {
         self != Projection::Flat
     }
 
-    /// The longitude the image spans, in radians. Meaningless for [`Flat`],
-    /// which is built by [`screen_mesh`] instead.
-    fn arc(self) -> f32 {
+    /// The equirectangular bounds this projection is shorthand for, if any.
+    pub fn bounds(self) -> Option<Bounds> {
         match self {
-            Projection::Equirect360 => std::f32::consts::TAU,
-            _ => std::f32::consts::PI,
+            Projection::Equirect360 => Some(Bounds::FULL),
+            // The front half: a quarter of the sphere cropped from each side.
+            Projection::Equirect180 => Some(Bounds {
+                top: 0.0,
+                bottom: 0.0,
+                left: 0.25,
+                right: 0.25,
+            }),
+            _ => None,
         }
     }
 }
@@ -131,6 +223,52 @@ pub const DEFAULT_SCREEN_WIDTH_DEG: f32 = 45.0;
 /// Where the screen stands, in metres. Far enough that the eyes relax, near
 /// enough that it does not feel painted on the horizon.
 pub const DEFAULT_SCREEN_DISTANCE: f32 = 4.0;
+
+/// How much of the sphere a frame covers, as the `equi` box states it.
+///
+/// Each field is the proportion of the projection cropped from that edge and is
+/// not covered by the video, so all zeroes is the whole sphere. The box stores
+/// them as 0.32 fixed point; they arrive here as fractions.
+///
+/// This is what makes 360° and VR180 two points on one scale rather than two
+/// cases: a hemisphere is a quarter cropped from each side, and a file that
+/// covers, say, 270° by 140° is neither and is perfectly legal.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Bounds {
+    pub top: f32,
+    pub bottom: f32,
+    pub left: f32,
+    pub right: f32,
+}
+
+impl Bounds {
+    /// The whole sphere.
+    pub const FULL: Bounds = Bounds {
+        top: 0.0,
+        bottom: 0.0,
+        left: 0.0,
+        right: 0.0,
+    };
+
+    /// Whether the crops leave anything to draw.
+    pub fn is_usable(self) -> bool {
+        [self.top, self.bottom, self.left, self.right]
+            .iter()
+            .all(|v| v.is_finite() && (0.0..1.0).contains(v))
+            && self.top + self.bottom < 1.0
+            && self.left + self.right < 1.0
+    }
+
+    /// Longitude covered, in radians.
+    pub fn arc(self) -> f32 {
+        (1.0 - self.left - self.right) * std::f32::consts::TAU
+    }
+
+    /// Latitude covered, in radians.
+    pub fn pitch_span(self) -> f32 {
+        (1.0 - self.top - self.bottom) * std::f32::consts::PI
+    }
+}
 
 /// Which eye a frame is being drawn for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -203,20 +341,20 @@ pub const fn vertex_count(rings: u32, sectors: u32) -> usize {
     (rings as usize + 1) * (sectors as usize + 1)
 }
 
-/// Number of indices [`sphere_indices`] will write for this tessellation.
+/// How many indices to make room for at this tessellation.
 ///
-/// Independent of the projection: a hemisphere uses the same grid, stretched
-/// over half the longitude.
-///
-/// Two triangles per grid cell, except along the two polar rows where one
-/// corner of the cell collapses onto the pole and one of the two triangles has
-/// no area. Those are skipped: a degenerate triangle costs a primitive-assembly
-/// slot for nothing.
+/// An upper bound, not an exact count: two triangles per grid cell everywhere.
+/// Where the mesh reaches a pole one corner of the cell collapses and one of
+/// the two triangles has no area, and those are skipped — a degenerate triangle
+/// costs a primitive-assembly slot for nothing. How many are skipped depends on
+/// whether the covered patch reaches the poles at all, which the buffer has to
+/// be allocated without knowing. Draw with the count [`sphere_indices`]
+/// returns, not with this.
 pub const fn index_count(rings: u32, sectors: u32) -> usize {
     if rings < 2 {
         return 0;
     }
-    6 * (rings as usize - 1) * sectors as usize
+    6 * rings as usize * sectors as usize
 }
 
 /// Writes an inside-out UV sphere as interleaved `[x, y, z, u, v]` vertices.
@@ -236,20 +374,45 @@ pub fn sphere_mesh(
     projection: Projection,
     out: &mut [f32],
 ) -> Option<usize> {
+    sphere_mesh_bounded(rings, sectors, radius, projection.bounds()?, out)
+}
+
+/// The same, over an arbitrary patch of the sphere.
+///
+/// This is the general case and [`sphere_mesh`] is two named points on it. A
+/// file is free to cover 270° by 140°, and the `equi` box says so in exactly
+/// these terms; treating coverage as a pair of presets meant such a file was
+/// stretched over whichever preset was nearest.
+pub fn sphere_mesh_bounded(
+    rings: u32,
+    sectors: u32,
+    radius: f32,
+    bounds: Bounds,
+    out: &mut [f32],
+) -> Option<usize> {
     let count = vertex_count(rings, sectors);
     if rings < 2 || sectors < 3 || count > MAX_VERTICES || out.len() < count * VERTEX_FLOATS {
         return None;
     }
-    let arc = projection.arc();
+    if !bounds.is_usable() {
+        return None;
+    }
+    let arc = bounds.arc();
+    // Where the covered patch sits. A crop that is not symmetric moves the
+    // middle of the picture off the straight-ahead direction, which is correct:
+    // the file says which part of the sphere it holds, not merely how much.
+    let lon_centre = (bounds.left - bounds.right) * std::f32::consts::PI;
+    let lat_top = (0.5 - bounds.top) * std::f32::consts::PI;
+    let lat_span = bounds.pitch_span();
 
     let mut w = 0;
     for ring in 0..=rings {
-        // Rows run from the zenith down, so that consecutive vertices are
-        // adjacent in memory the way the index buffer walks them.
+        // Rows run from the top of the covered patch down, so that consecutive
+        // vertices are adjacent in memory the way the index buffer walks them.
         let down = ring as f32 / rings as f32;
-        // Texture space is bottom-up: the zenith is v = 1.
+        // Texture space is bottom-up: the first row is v = 1.
         let v = 1.0 - down;
-        let lat = (0.5 - down) * std::f32::consts::PI;
+        let lat = lat_top - down * lat_span;
         let (sin_lat, cos_lat) = lat.sin_cos();
         let y = radius * sin_lat;
         // Radius of this latitude's circle.
@@ -257,10 +420,9 @@ pub fn sphere_mesh(
 
         for sector in 0..=sectors {
             let u = sector as f32 / sectors as f32;
-            // Longitude, zero straight ahead so the image centre is straight
-            // ahead. The image always spans the full `u` range; what changes
-            // between projections is how much world that is.
-            let lon = (u - 0.5) * arc;
+            // Longitude. The image always spans the full `u` range; the bounds
+            // say how much world that is and where it sits.
+            let lon = lon_centre + (u - 0.5) * arc;
             let (sin_lon, cos_lon) = lon.sin_cos();
 
             out[w] = r * sin_lon;
@@ -279,9 +441,34 @@ pub fn sphere_mesh(
 /// Returns the number of indices written, or `None` on the same conditions as
 /// [`sphere_mesh`].
 pub fn sphere_indices(rings: u32, sectors: u32, out: &mut [u16]) -> Option<usize> {
-    let count = index_count(rings, sectors);
-    if rings < 2 || sectors < 3 || vertex_count(rings, sectors) > MAX_VERTICES || out.len() < count
-    {
+    sphere_indices_bounded(rings, sectors, Bounds::FULL, out)
+}
+
+/// The same, for a mesh built by [`sphere_mesh_bounded`].
+///
+/// The bounds matter here for one reason: the top and bottom rows of a full
+/// sphere collapse onto the poles, so half of each of those cells is a triangle
+/// with no area and is dropped. Crop the sphere and those rows are ordinary
+/// quads that need both triangles — dropping them would leave two visible bands
+/// of nothing along the top and bottom of the picture.
+pub fn sphere_indices_bounded(
+    rings: u32,
+    sectors: u32,
+    bounds: Bounds,
+    out: &mut [u16],
+) -> Option<usize> {
+    if rings < 2 || sectors < 3 || vertex_count(rings, sectors) > MAX_VERTICES {
+        return None;
+    }
+    if !bounds.is_usable() {
+        return None;
+    }
+    // Only an uncropped edge actually reaches a pole.
+    let at_zenith = bounds.top == 0.0;
+    let at_nadir = bounds.bottom == 0.0;
+    let count = index_count(rings, sectors)
+        - 3 * sectors as usize * (usize::from(at_zenith) + usize::from(at_nadir));
+    if out.len() < count {
         return None;
     }
 
@@ -297,19 +484,190 @@ pub fn sphere_indices(rings: u32, sectors: u32, out: &mut [u16]) -> Option<usize
             let c = a + stride as u16;
             let d = c + 1;
 
-            // At the zenith a and b are the same point, at the nadir c and d
-            // are — so one triangle of the cell is degenerate and dropped.
-            if ring > 0 {
+            if ring > 0 || !at_zenith {
                 out[w] = a;
                 out[w + 1] = d;
                 out[w + 2] = b;
                 w += 3;
             }
-            if ring + 1 < rings {
+            if ring + 1 < rings || !at_nadir {
                 out[w] = a;
                 out[w + 1] = c;
                 out[w + 2] = d;
                 w += 3;
+            }
+        }
+    }
+    debug_assert_eq!(w, count);
+    Some(count)
+}
+
+/// One face of a cube map: where it points, and where its picture sits.
+///
+/// `centre` is the direction the middle of the face lies in; `right` and `up`
+/// are the world directions that image-right and image-up point along once you
+/// are looking at it. Straight ahead is `-Z`, up is `+Y`, and turning right
+/// goes towards `+X`, which is the convention [`sphere_mesh_bounded`] builds
+/// to.
+struct CubeFace {
+    centre: [f32; 3],
+    right: [f32; 3],
+    up: [f32; 3],
+    column: u32,
+    row: u32,
+}
+
+/// The six faces, in the order and orientation the `cbmp` box's layout 0 packs
+/// them into a 3x2 grid.
+///
+/// The two odd ones are the poles. Tilt your head back to look at the ceiling
+/// and your head's up direction swings from `+Y` towards `-Z`, so the top of
+/// the ceiling image points forward; look down and it swings towards `+Z`, so
+/// the top of the floor image points backwards. The spec words this as "top of
+/// face forward" and "top of face backward", and this is what that means.
+const CUBE_FACES: [CubeFace; 6] = [
+    CubeFace {
+        centre: [1.0, 0.0, 0.0],
+        right: [0.0, 0.0, 1.0],
+        up: [0.0, 1.0, 0.0],
+        column: 0,
+        row: 0,
+    },
+    CubeFace {
+        centre: [-1.0, 0.0, 0.0],
+        right: [0.0, 0.0, -1.0],
+        up: [0.0, 1.0, 0.0],
+        column: 1,
+        row: 0,
+    },
+    CubeFace {
+        centre: [0.0, 1.0, 0.0],
+        right: [-1.0, 0.0, 0.0],
+        up: [0.0, 0.0, -1.0],
+        column: 2,
+        row: 0,
+    },
+    CubeFace {
+        centre: [0.0, -1.0, 0.0],
+        right: [-1.0, 0.0, 0.0],
+        up: [0.0, 0.0, 1.0],
+        column: 0,
+        row: 1,
+    },
+    CubeFace {
+        centre: [0.0, 0.0, -1.0],
+        right: [1.0, 0.0, 0.0],
+        up: [0.0, 1.0, 0.0],
+        column: 1,
+        row: 1,
+    },
+    CubeFace {
+        centre: [0.0, 0.0, 1.0],
+        right: [-1.0, 0.0, 0.0],
+        up: [0.0, 1.0, 0.0],
+        column: 2,
+        row: 1,
+    },
+];
+
+/// Columns and rows the `cbmp` layout 0 grid has.
+const CUBE_COLUMNS: f32 = 3.0;
+const CUBE_ROWS: f32 = 2.0;
+
+/// Vertices [`cubemap_mesh`] writes: six independent faces, each a grid.
+///
+/// The faces cannot share vertices even where they meet in space, because they
+/// do not meet in the texture — a shared corner would need six texture
+/// coordinates at once.
+pub const fn cubemap_vertex_count(cells: u32) -> usize {
+    6 * (cells as usize + 1) * (cells as usize + 1)
+}
+
+/// Indices [`cubemap_indices`] writes: two triangles per cell, six faces.
+pub const fn cubemap_index_count(cells: u32) -> usize {
+    36 * cells as usize * cells as usize
+}
+
+/// Writes the six faces of a cube as interleaved `[x, y, z, u, v]` vertices.
+///
+/// A cube map spends its pixels far more evenly than an equirectangular image,
+/// which crowds them into the poles nobody looks at and starves the horizon
+/// everybody does. Recent 360 material increasingly ships this way.
+///
+/// `padding` is the proportion of each grid cell to ignore along each of its
+/// edges, from the box's pixel count divided by the face's pixel size. Encoders
+/// pad the faces because bilinear filtering at a face edge would otherwise
+/// fetch texels belonging to a face pointing somewhere else entirely, which
+/// shows up as a bright seam along every cube edge.
+///
+/// The faces are flat and the texture maps onto them linearly, so one cell per
+/// face is already exact; `cells` exists for the same reason a screen is
+/// subdivided, to keep the interpolation of anything applied per-vertex honest.
+pub fn cubemap_mesh(cells: u32, radius: f32, padding: f32, out: &mut [f32]) -> Option<usize> {
+    let count = cubemap_vertex_count(cells);
+    if cells == 0 || count > MAX_VERTICES || out.len() < count * VERTEX_FLOATS {
+        return None;
+    }
+    if !padding.is_finite() || !(0.0..0.5).contains(&padding) || !radius.is_finite() {
+        return None;
+    }
+
+    let mut w = 0;
+    for face in &CUBE_FACES {
+        // The cell this face occupies, shrunk by the padding. Texture space is
+        // bottom-up, so the grid's first row is the upper half of v.
+        let (column, row) = (face.column as f32, face.row as f32);
+        let u0 = (column + padding) / CUBE_COLUMNS;
+        let u1 = (column + 1.0 - padding) / CUBE_COLUMNS;
+        let v1 = (CUBE_ROWS - row - padding) / CUBE_ROWS;
+        let v0 = (CUBE_ROWS - row - 1.0 + padding) / CUBE_ROWS;
+
+        for y in 0..=cells {
+            let t = y as f32 / cells as f32;
+            for x in 0..=cells {
+                let s = x as f32 / cells as f32;
+                // From the middle of the face out to its edges, in the two
+                // directions the image runs.
+                let a = 2.0 * s - 1.0;
+                let b = 2.0 * t - 1.0;
+                for axis in 0..3 {
+                    out[w + axis] =
+                        radius * (face.centre[axis] + face.right[axis] * a + face.up[axis] * b);
+                }
+                out[w + 3] = u0 + (u1 - u0) * s;
+                out[w + 4] = v0 + (v1 - v0) * t;
+                w += VERTEX_FLOATS;
+            }
+        }
+    }
+    Some(count)
+}
+
+/// Writes the triangle indices for a [`cubemap_mesh`] of the same tessellation.
+pub fn cubemap_indices(cells: u32, out: &mut [u16]) -> Option<usize> {
+    let count = cubemap_index_count(cells);
+    if cells == 0 || cubemap_vertex_count(cells) > MAX_VERTICES || out.len() < count {
+        return None;
+    }
+
+    let stride = cells + 1;
+    let per_face = (stride * stride) as u16;
+    let mut w = 0;
+    for face in 0..6u16 {
+        let base = face * per_face;
+        for y in 0..cells {
+            for x in 0..cells {
+                let a = base + (y * stride + x) as u16;
+                let b = a + 1;
+                let c = a + stride as u16;
+                let d = c + 1;
+                out[w] = a;
+                out[w + 1] = c;
+                out[w + 2] = d;
+                out[w + 3] = a;
+                out[w + 4] = d;
+                out[w + 5] = b;
+                w += 6;
             }
         }
     }
@@ -335,6 +693,10 @@ pub fn uv_window(layout: StereoLayout, eye: Eye) -> [f32; 4] {
         // Horizontal is unaffected by that flip: the left eye is still the left
         // half of the frame.
         StereoLayout::SideBySide => [0.5, if second { 0.5 } else { 0.0 }, 1.0, 0.0],
+        // Both eyes cover the whole frame; what separates them is colour or
+        // row, and the fragment shader does that. Returning the identity means
+        // one geometry path serves every packing.
+        StereoLayout::Anaglyph | StereoLayout::RowInterleaved => [1.0, 0.0, 1.0, 0.0],
     }
 }
 
@@ -535,19 +897,63 @@ pub extern "C" fn xr_pano_index_count(rings: u32, sectors: u32) -> u32 {
     index_count(rings, sectors) as u32
 }
 
-/// Fills `out` with interleaved `[x, y, z, u, v]` vertices. Returns the vertex
-/// count, or -1 if the tessellation or the capacity is unusable.
-///
-/// `projection` is 0 for a full sphere and 1 for the VR180 front hemisphere.
+/// Reads a `[top, bottom, left, right]` bounds pointer, treating null as the
+/// whole sphere.
 ///
 /// # Safety
-/// `out` must point to `cap_floats` writable, aligned `f32`s.
+/// `p` must be null or point to four readable, aligned `f32`s.
+unsafe fn bounds_from(p: *const f32) -> Bounds {
+    if p.is_null() {
+        return Bounds::FULL;
+    }
+    let b = std::slice::from_raw_parts(p, 4);
+    Bounds {
+        top: b[0],
+        bottom: b[1],
+        left: b[2],
+        right: b[3],
+    }
+}
+
+/// Writes the `[top, bottom, left, right]` bounds a projection is shorthand
+/// for. Returns 0, or -1 for a projection that is not a patch of a sphere.
+///
+/// The renderer converts once, here, and passes bounds everywhere after that —
+/// so a file that states its own coverage in the `equi` box travels the same
+/// path as one that only says "360" or "180".
+///
+/// # Safety
+/// `out` must point to four writable, aligned `f32`s.
+#[no_mangle]
+pub unsafe extern "C" fn xr_pano_bounds(projection: u32, out: *mut f32) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    match Projection::from_raw(projection).bounds() {
+        Some(b) => {
+            let slice = std::slice::from_raw_parts_mut(out, 4);
+            slice.copy_from_slice(&[b.top, b.bottom, b.left, b.right]);
+            0
+        }
+        None => -1,
+    }
+}
+
+/// Fills `out` with interleaved `[x, y, z, u, v]` vertices. Returns the vertex
+/// count, or -1 if the tessellation, the bounds or the capacity is unusable.
+///
+/// `bounds` is `[top, bottom, left, right]`, the proportion of the sphere the
+/// video does *not* cover on each side, or null for all of it.
+///
+/// # Safety
+/// `out` must point to `cap_floats` writable, aligned `f32`s, and `bounds` must
+/// be null or point to four readable, aligned `f32`s.
 #[no_mangle]
 pub unsafe extern "C" fn xr_pano_mesh(
     rings: u32,
     sectors: u32,
     radius: f32,
-    projection: u32,
+    bounds: *const f32,
     out: *mut f32,
     cap_floats: usize,
 ) -> i32 {
@@ -555,24 +961,23 @@ pub unsafe extern "C" fn xr_pano_mesh(
         return -1;
     }
     let slice = std::slice::from_raw_parts_mut(out, cap_floats);
-    sphere_mesh(
-        rings,
-        sectors,
-        radius,
-        Projection::from_raw(projection),
-        slice,
-    )
-    .map_or(-1, |n| n as i32)
+    sphere_mesh_bounded(rings, sectors, radius, bounds_from(bounds), slice).map_or(-1, |n| n as i32)
 }
 
 /// Fills `out` with triangle indices. Returns the index count, or -1.
 ///
+/// The count depends on the bounds — a cropped sphere needs the polar rows a
+/// full one drops — so draw with what this returns, not with
+/// [`xr_pano_index_count`], which is only large enough for either.
+///
 /// # Safety
-/// `out` must point to `cap` writable, aligned `u16`s.
+/// `out` must point to `cap` writable, aligned `u16`s, and `bounds` must be
+/// null or point to four readable, aligned `f32`s.
 #[no_mangle]
 pub unsafe extern "C" fn xr_pano_indices(
     rings: u32,
     sectors: u32,
+    bounds: *const f32,
     out: *mut u16,
     cap: usize,
 ) -> i32 {
@@ -580,7 +985,72 @@ pub unsafe extern "C" fn xr_pano_indices(
         return -1;
     }
     let slice = std::slice::from_raw_parts_mut(out, cap);
-    sphere_indices(rings, sectors, slice).map_or(-1, |n| n as i32)
+    sphere_indices_bounded(rings, sectors, bounds_from(bounds), slice).map_or(-1, |n| n as i32)
+}
+
+/// Writes the three channel weights one eye's picture survives in, for an
+/// anaglyph frame. `pair` is 0 red/cyan, 1 green/magenta, 2 yellow/blue, each
+/// named left eye first; `eye` is 0 for left. Returns 0, or -1.
+///
+/// # Safety
+/// `out` must point to three writable, aligned `f32`s.
+#[no_mangle]
+pub unsafe extern "C" fn xr_anaglyph_mix(pair: u32, eye: i32, out: *mut f32) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    let eye = if eye == 0 { Eye::Left } else { Eye::Right };
+    let mix = anaglyph_mix(AnaglyphPair::from_raw(pair), eye);
+    std::slice::from_raw_parts_mut(out, 3).copy_from_slice(&mix);
+    0
+}
+
+/// Vertices [`xr_cube_mesh`] will write, for sizing the buffer.
+#[no_mangle]
+pub extern "C" fn xr_cube_vertex_count(cells: u32) -> u32 {
+    cubemap_vertex_count(cells) as u32
+}
+
+/// Indices [`xr_cube_indices`] will write, for sizing the buffer.
+#[no_mangle]
+pub extern "C" fn xr_cube_index_count(cells: u32) -> u32 {
+    cubemap_index_count(cells) as u32
+}
+
+/// Fills `out` with the six faces of a cube map, as interleaved
+/// `[x, y, z, u, v]` vertices. Returns the vertex count, or -1.
+///
+/// `padding` is the `cbmp` box's pixel padding divided by the pixel size of one
+/// face — the caller has the frame's dimensions and this does not.
+///
+/// # Safety
+/// `out` must point to `cap_floats` writable, aligned `f32`s.
+#[no_mangle]
+pub unsafe extern "C" fn xr_cube_mesh(
+    cells: u32,
+    radius: f32,
+    padding: f32,
+    out: *mut f32,
+    cap_floats: usize,
+) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    let slice = std::slice::from_raw_parts_mut(out, cap_floats);
+    cubemap_mesh(cells, radius, padding, slice).map_or(-1, |n| n as i32)
+}
+
+/// Fills `out` with the cube map's triangle indices. Returns the count, or -1.
+///
+/// # Safety
+/// `out` must point to `cap` writable, aligned `u16`s.
+#[no_mangle]
+pub unsafe extern "C" fn xr_cube_indices(cells: u32, out: *mut u16, cap: usize) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    let slice = std::slice::from_raw_parts_mut(out, cap);
+    cubemap_indices(cells, slice).map_or(-1, |n| n as i32)
 }
 
 /// Writes `[u_scale, u_offset, v_scale, v_offset]` for one eye of a stereo
@@ -697,10 +1167,11 @@ mod tests {
             sphere_mesh(RINGS, SECTORS, 1.0, Projection::Equirect360, &mut verts),
             Some(vertex_count(RINGS, SECTORS))
         );
-        assert_eq!(
-            sphere_indices(RINGS, SECTORS, &mut idx),
-            Some(index_count(RINGS, SECTORS))
-        );
+        // A full sphere drops the half of each polar cell that has no area, so
+        // it writes fewer indices than the buffer holds.
+        let written = sphere_indices(RINGS, SECTORS, &mut idx).expect("indices");
+        assert_eq!(written, index_count(RINGS, SECTORS) - 6 * SECTORS as usize);
+        idx.truncate(written);
         (verts, idx)
     }
 
@@ -1232,5 +1703,383 @@ mod tests {
     fn project(m: &[f32; 16], p: [f32; 3]) -> [f32; 2] {
         let v = project_raw(m, p);
         [v[0] / v[3], v[1] / v[3]]
+    }
+
+    // -- bounded spheres ----------------------------------------------------
+
+    /// The direction of a vertex, and its texture coordinate.
+    fn vertex(verts: &[f32], i: usize) -> ([f32; 3], [f32; 2]) {
+        let o = i * VERTEX_FLOATS;
+        (
+            [verts[o], verts[o + 1], verts[o + 2]],
+            [verts[o + 3], verts[o + 4]],
+        )
+    }
+
+    fn bounded(bounds: Bounds) -> Vec<f32> {
+        let mut verts = vec![0.0f32; vertex_count(RINGS, SECTORS) * VERTEX_FLOATS];
+        sphere_mesh_bounded(RINGS, SECTORS, 1.0, bounds, &mut verts).expect("bounded sphere");
+        verts
+    }
+
+    #[test]
+    fn the_named_projections_are_the_bounds_they_stand_for() {
+        // If these two ever disagree, a file that states its coverage and an
+        // identical one that only says "180" would render differently.
+        for projection in [Projection::Equirect360, Projection::Equirect180] {
+            let mut named = vec![0.0f32; vertex_count(RINGS, SECTORS) * VERTEX_FLOATS];
+            sphere_mesh(RINGS, SECTORS, 1.0, projection, &mut named).unwrap();
+            let stated = bounded(projection.bounds().unwrap());
+            assert_eq!(named, stated, "{projection:?} via bounds");
+        }
+        assert_eq!(Projection::Flat.bounds(), None);
+        assert_eq!(Projection::Cubemap.bounds(), None);
+    }
+
+    #[test]
+    fn cropped_bounds_narrow_the_sphere_without_moving_its_middle() {
+        // A symmetric crop covers less world but is still centred straight
+        // ahead — the middle of the picture is the middle of the picture.
+        let bounds = Bounds {
+            top: 0.1,
+            bottom: 0.1,
+            left: 0.125,
+            right: 0.125,
+        };
+        let verts = bounded(bounds);
+        let stride = (SECTORS + 1) as usize;
+        let middle = (RINGS as usize / 2) * stride + SECTORS as usize / 2;
+        let (dir, uv) = vertex(&verts, middle);
+        assert!((uv[0] - 0.5).abs() < 1e-6 && (uv[1] - 0.5).abs() < 1e-6);
+        assert!(
+            dir[0].abs() < 1e-5 && dir[1].abs() < 1e-5,
+            "not centred: {dir:?}"
+        );
+        assert!(dir[2] < -0.99, "not straight ahead: {dir:?}");
+
+        // Three quarters of the longitude, four fifths of the latitude.
+        assert!((bounds.arc() - 0.75 * std::f32::consts::TAU).abs() < 1e-5);
+        assert!((bounds.pitch_span() - 0.8 * std::f32::consts::PI).abs() < 1e-5);
+    }
+
+    #[test]
+    fn an_off_centre_crop_moves_the_picture_where_the_file_says() {
+        // Cropping only one side means the covered patch is not centred, and
+        // pretending otherwise would swing the whole world sideways.
+        let verts = bounded(Bounds {
+            top: 0.0,
+            bottom: 0.0,
+            left: 0.25,
+            right: 0.0,
+        });
+        let stride = (SECTORS + 1) as usize;
+        let middle = (RINGS as usize / 2) * stride + SECTORS as usize / 2;
+        let (dir, _) = vertex(&verts, middle);
+        // Left-cropped by a quarter turn: the middle of what remains sits 45°
+        // to the right of straight ahead.
+        let heading = dir[0].atan2(-dir[2]).to_degrees();
+        assert!((heading - 45.0).abs() < 0.5, "heading {heading}");
+    }
+
+    #[test]
+    fn a_cropped_sphere_keeps_the_triangles_a_full_one_drops() {
+        // The polar rows of a full sphere collapse to a point and half of each
+        // cell is dropped. Crop the poles away and those rows are ordinary
+        // quads; dropping them would leave a band of nothing top and bottom.
+        let mut idx = vec![0u16; index_count(RINGS, SECTORS)];
+        let full = sphere_indices_bounded(RINGS, SECTORS, Bounds::FULL, &mut idx).unwrap();
+        let cropped = sphere_indices_bounded(
+            RINGS,
+            SECTORS,
+            Bounds {
+                top: 0.05,
+                bottom: 0.05,
+                left: 0.0,
+                right: 0.0,
+            },
+            &mut idx,
+        )
+        .unwrap();
+        assert_eq!(cropped, index_count(RINGS, SECTORS));
+        assert_eq!(full, cropped - 6 * SECTORS as usize);
+
+        // One pole cropped, one not.
+        let half = sphere_indices_bounded(
+            RINGS,
+            SECTORS,
+            Bounds {
+                top: 0.05,
+                bottom: 0.0,
+                left: 0.0,
+                right: 0.0,
+            },
+            &mut idx,
+        )
+        .unwrap();
+        assert_eq!(half, cropped - 3 * SECTORS as usize);
+    }
+
+    #[test]
+    fn bounds_that_leave_nothing_are_refused() {
+        let mut verts = vec![0.0f32; vertex_count(RINGS, SECTORS) * VERTEX_FLOATS];
+        for bad in [
+            Bounds {
+                top: 0.5,
+                bottom: 0.5,
+                left: 0.0,
+                right: 0.0,
+            },
+            Bounds {
+                top: 0.0,
+                bottom: 0.0,
+                left: 0.9,
+                right: 0.2,
+            },
+            Bounds {
+                top: -0.1,
+                bottom: 0.0,
+                left: 0.0,
+                right: 0.0,
+            },
+            Bounds {
+                top: f32::NAN,
+                bottom: 0.0,
+                left: 0.0,
+                right: 0.0,
+            },
+        ] {
+            assert!(!bad.is_usable(), "{bad:?} should be refused");
+            assert_eq!(
+                sphere_mesh_bounded(RINGS, SECTORS, 1.0, bad, &mut verts),
+                None
+            );
+        }
+        assert!(Bounds::FULL.is_usable());
+    }
+
+    // -- cube maps -----------------------------------------------------------
+
+    /// One vertex of one face, by its place in the grid `cubemap_mesh` writes:
+    /// `x` runs along image-right and `y` along image-up, both from 0 to
+    /// `cells`.
+    fn cube_vertex(verts: &[f32], cells: u32, face: usize, x: u32, y: u32) -> ([f32; 3], [f32; 2]) {
+        let stride = (cells + 1) as usize;
+        vertex(
+            verts,
+            face * stride * stride + y as usize * stride + x as usize,
+        )
+    }
+
+    fn cube(cells: u32, padding: f32) -> Vec<f32> {
+        let mut verts = vec![0.0f32; cubemap_vertex_count(cells) * VERTEX_FLOATS];
+        assert_eq!(
+            cubemap_mesh(cells, 1.0, padding, &mut verts),
+            Some(cubemap_vertex_count(cells))
+        );
+        verts
+    }
+
+    #[test]
+    fn the_cube_faces_land_where_the_spec_packs_them() {
+        // The 3x2 grid of layout 0, read as the spec words it: Right, Left, Up
+        // across the top row of the image and Down, Front, Back across the
+        // bottom. Texture space is bottom-up, so the image's top row is the
+        // upper half of v — the flip that has caught every other surface here.
+        let verts = cube(2, 0.0);
+        for (face, name, dir, column, row) in [
+            (0, "right", [1.0, 0.0, 0.0], 0.0, 0.0),
+            (1, "left", [-1.0, 0.0, 0.0], 1.0, 0.0),
+            (2, "up", [0.0, 1.0, 0.0], 2.0, 0.0),
+            (3, "down", [0.0, -1.0, 0.0], 0.0, 1.0),
+            (4, "front", [0.0, 0.0, -1.0], 1.0, 1.0),
+            (5, "back", [0.0, 0.0, 1.0], 2.0, 1.0),
+        ] {
+            // The middle of a face points along its own axis and nothing else.
+            let (centre, uv) = cube_vertex(&verts, 2, face, 1, 1);
+            assert_eq!(centre, dir, "{name} centre");
+            let want = [(column + 0.5) / 3.0, (2.0 - row - 0.5) / 2.0];
+            assert!(
+                (uv[0] - want[0]).abs() < 1e-6 && (uv[1] - want[1]).abs() < 1e-6,
+                "{name}: sampled {uv:?}, expected {want:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn the_poles_are_oriented_the_way_a_tilted_head_expects() {
+        // Tilt your head back to look at the ceiling and your up direction
+        // swings from up towards forward, so the top of the ceiling image
+        // points forward; look down and it swings backwards. The spec words it
+        // as "top of face forward" and "top of face backward". Get it wrong and
+        // the sky is rotated half a turn against the walls, which reads as the
+        // world tearing overhead — visible only while wearing the thing.
+        let verts = cube(2, 0.0);
+        let up_face = 2;
+        let down_face = 3;
+
+        // Top edge of the ceiling image, halfway along: forward.
+        let (top_of_ceiling, uv) = cube_vertex(&verts, 2, up_face, 1, 2);
+        assert_eq!(
+            top_of_ceiling,
+            [0.0, 1.0, -1.0],
+            "ceiling top is not forward"
+        );
+        assert!(
+            (uv[1] - 1.0).abs() < 1e-6,
+            "not the top of the image: {uv:?}"
+        );
+
+        // Top edge of the floor image: backward.
+        let (top_of_floor, uv) = cube_vertex(&verts, 2, down_face, 1, 2);
+        assert_eq!(top_of_floor, [0.0, -1.0, 1.0], "floor top is not backward");
+        assert!(
+            (uv[1] - 0.5).abs() < 1e-6,
+            "not the top of that cell: {uv:?}"
+        );
+
+        // And the ceiling's forward edge is the same place in the world as the
+        // front wall's top edge, so the two pictures meet rather than overlap.
+        let (front_top, _) = cube_vertex(&verts, 2, 4, 1, 2);
+        assert_eq!(
+            front_top, top_of_ceiling,
+            "ceiling and front wall do not meet"
+        );
+    }
+
+    #[test]
+    fn every_cube_edge_is_shared_by_exactly_two_faces() {
+        // A cube map is only a closed world if the faces agree on where they
+        // meet. Each of the twelve edges is built twice, once by each face
+        // that owns it, and a sign error in the table shows up as an edge no
+        // second face reaches.
+        let cells = 2;
+        let verts = cube(cells, 0.0);
+        let key = |p: [f32; 3]| p.map(|v| (v * 1e4).round() as i32);
+        let mut corners = std::collections::BTreeMap::new();
+        for face in 0..6 {
+            for (x, y) in [(0, 0), (cells, 0), (0, cells), (cells, cells)] {
+                let (p, _) = cube_vertex(&verts, cells, face, x, y);
+                *corners.entry(key(p)).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(corners.len(), 8, "a cube has eight corners");
+        for (corner, faces) in corners {
+            assert_eq!(faces, 3, "corner {corner:?} is built by {faces} faces");
+        }
+    }
+
+    #[test]
+    fn cube_padding_shrinks_every_face_towards_its_middle() {
+        // Padding exists so that filtering at a face edge cannot reach across
+        // into a face pointing somewhere else. Trimming it moves the texture
+        // coordinates in and leaves the geometry alone.
+        let plain = cube(1, 0.0);
+        let padded = cube(1, 0.1);
+
+        for i in 0..cubemap_vertex_count(1) {
+            let (plain_dir, plain_uv) = vertex(&plain, i);
+            let (padded_dir, padded_uv) = vertex(&padded, i);
+            assert_eq!(plain_dir, padded_dir, "geometry moved");
+            // Every vertex of a single-cell face is a corner, so each moves
+            // inwards by a tenth of a cell in both directions.
+            assert!((plain_uv[0] - padded_uv[0]).abs() > 1e-4);
+            assert!((plain_uv[1] - padded_uv[1]).abs() > 1e-4);
+        }
+
+        let mut scratch = plain.clone();
+        assert_eq!(
+            cubemap_mesh(1, 1.0, 0.5, &mut scratch),
+            None,
+            "half is not a face"
+        );
+        assert_eq!(cubemap_mesh(0, 1.0, 0.0, &mut scratch), None, "no cells");
+    }
+
+    #[test]
+    fn cube_indices_cover_every_face_and_stay_in_range() {
+        for cells in [1u32, 4, 16] {
+            let mut idx = vec![0u16; cubemap_index_count(cells)];
+            assert_eq!(cubemap_indices(cells, &mut idx), Some(idx.len()));
+            let limit = cubemap_vertex_count(cells) as u16;
+            assert!(idx.iter().all(|&i| i < limit), "index out of range");
+            let per_face = (cells as u16 + 1) * (cells as u16 + 1);
+            for face in 0..6u16 {
+                assert!(
+                    idx.iter().any(|&i| i / per_face == face),
+                    "face {face} has no triangles",
+                );
+            }
+        }
+    }
+
+    // -- packings that are not windows ---------------------------------------
+
+    #[test]
+    fn the_packings_that_need_a_shader_say_so() {
+        for layout in [
+            StereoLayout::Mono,
+            StereoLayout::OverUnder,
+            StereoLayout::SideBySide,
+        ] {
+            assert!(layout.is_windowed(), "{layout:?}");
+        }
+        for layout in [StereoLayout::Anaglyph, StereoLayout::RowInterleaved] {
+            assert!(!layout.is_windowed(), "{layout:?}");
+            // Both eyes see the whole frame; the difference is per pixel.
+            for eye in [Eye::Left, Eye::Right] {
+                assert_eq!(uv_window(layout, eye), [1.0, 0.0, 1.0, 0.0]);
+            }
+        }
+        assert_eq!(StereoLayout::from_raw(3), StereoLayout::Anaglyph);
+        assert_eq!(StereoLayout::from_raw(4), StereoLayout::RowInterleaved);
+    }
+
+    #[test]
+    fn each_anaglyph_filter_takes_the_channels_the_other_leaves() {
+        // The two eyes must not share a channel — that is the whole mechanism —
+        // and each eye's weights must sum to one, or one eye comes out darker
+        // than the other and the pair is unfusable.
+        for pair in [
+            AnaglyphPair::RedCyan,
+            AnaglyphPair::GreenMagenta,
+            AnaglyphPair::YellowBlue,
+        ] {
+            let left = anaglyph_mix(pair, Eye::Left);
+            let right = anaglyph_mix(pair, Eye::Right);
+            assert!(
+                (left.iter().sum::<f32>() - 1.0).abs() < 1e-6,
+                "{pair:?} left"
+            );
+            assert!(
+                (right.iter().sum::<f32>() - 1.0).abs() < 1e-6,
+                "{pair:?} right"
+            );
+            for channel in 0..3 {
+                assert!(
+                    left[channel] == 0.0 || right[channel] == 0.0,
+                    "{pair:?} shares channel {channel}",
+                );
+            }
+            // And between them they use all of it, or part of the picture is
+            // being thrown away.
+            for channel in 0..3 {
+                assert!(
+                    left[channel] + right[channel] > 0.0,
+                    "{pair:?} drops {channel}"
+                );
+            }
+            // The name is a claim about which eye is where, and it is the claim
+            // that was wrong first time round: the left eye lives in the
+            // channel the pair is named after.
+            let named_channel = match pair {
+                AnaglyphPair::RedCyan => 0,
+                AnaglyphPair::GreenMagenta => 1,
+                AnaglyphPair::YellowBlue => 0,
+            };
+            assert!(
+                left[named_channel] > 0.0,
+                "{pair:?}: the left eye is not in the channel the name gives it",
+            );
+        }
     }
 }

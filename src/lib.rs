@@ -20,6 +20,8 @@
 use core::fmt;
 
 pub mod hidraw;
+/// Reading a media library's answers about how its files are packed.
+pub mod library;
 #[cfg(feature = "render")]
 pub mod mesh;
 #[cfg(feature = "render")]
