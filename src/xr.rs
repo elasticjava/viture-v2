@@ -74,6 +74,52 @@ struct Hot {
 }
 
 impl Hot {
+    /// Publishes several words so that no reader can see half of the set.
+    ///
+    /// The write side of a sequence lock. The counter goes odd before the
+    /// stores and even after; a reader that saw an odd counter, or a different
+    /// one either side of its read, tries again.
+    ///
+    /// Writers do not exclude each other here — the callers that use it are
+    /// either the single reader thread or the rare configuration calls, and
+    /// those are serialised by [`Tracker::writer`].
+    #[inline]
+    fn publish(seq: &AtomicU32, write: impl FnOnce()) {
+        let version = seq.load(Ordering::Relaxed);
+        // Odd: a write is in progress. Release, so the stores cannot be seen
+        // before it.
+        seq.store(version.wrapping_add(1), Ordering::Release);
+        write();
+        // Even again, and Release so the stores are visible before it is.
+        seq.store(version.wrapping_add(2), Ordering::Release);
+    }
+
+    /// Reads a set of words that was whole at some instant.
+    ///
+    /// The read side. Never blocks and never waits on a writer: it retries a
+    /// bounded number of times and then takes what is there, because on a path
+    /// the renderer walks every frame a slightly stale value beats a stalled
+    /// frame. The writer holds the lock for a handful of stores, so losing
+    /// twice running is already unlikely and losing eight times is not a thing
+    /// that happens.
+    #[inline]
+    fn consistent<T>(seq: &AtomicU32, read: impl Fn() -> T) -> T {
+        for _ in 0..LOAD_RETRIES {
+            let before = seq.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                // A write is in progress. A pause hint, not a yield and not a
+                // sleep: the writer is a few stores from finishing.
+                core::hint::spin_loop();
+                continue;
+            }
+            let value = read();
+            if seq.load(Ordering::Acquire) == before {
+                return value;
+            }
+        }
+        read()
+    }
+
     /// Publishes a quaternion so that no reader can see half of it.
     ///
     /// Four atomics written one at a time are not one atomic write, and this
@@ -88,15 +134,11 @@ impl Hot {
     /// counter goes odd before the write and even after; a reader that sees an
     /// odd counter, or a different one afterwards, tries again.
     fn store_quat(seq: &AtomicU32, slot: &[AtomicU32; 4], q: [f32; 4]) {
-        let version = seq.load(Ordering::Relaxed);
-        // Odd: a write is in progress. Release so the stores below cannot be
-        // seen before it.
-        seq.store(version.wrapping_add(1), Ordering::Release);
-        for (a, v) in slot.iter().zip(q) {
-            a.store(v.to_bits(), Ordering::Relaxed);
-        }
-        // Even again, and Release so the stores are visible before it is.
-        seq.store(version.wrapping_add(2), Ordering::Release);
+        Hot::publish(seq, || {
+            for (a, v) in slot.iter().zip(q) {
+                a.store(v.to_bits(), Ordering::Relaxed);
+            }
+        });
     }
 
     /// Reads a quaternion that was whole at some instant.
@@ -107,26 +149,13 @@ impl Hot {
     /// they are — which is what the old code always did — because a stale-ish
     /// pose beats blocking a frame.
     fn load_quat(seq: &AtomicU32, slot: &[AtomicU32; 4]) -> [f32; 4] {
-        for _ in 0..LOAD_RETRIES {
-            let before = seq.load(Ordering::Acquire);
-            if before & 1 != 0 {
-                // A write is in progress; let it finish.
-                core::hint::spin_loop();
-                continue;
-            }
+        Hot::consistent(seq, || {
             let mut q = [0f32; 4];
             for (i, a) in slot.iter().enumerate() {
                 q[i] = f32::from_bits(a.load(Ordering::Relaxed));
             }
-            if seq.load(Ordering::Acquire) == before {
-                return q;
-            }
-        }
-        let mut q = [0f32; 4];
-        for (i, a) in slot.iter().enumerate() {
-            q[i] = f32::from_bits(a.load(Ordering::Relaxed));
-        }
-        q
+            q
+        })
     }
 
     fn load_vec3(slot: &[AtomicU32; 3]) -> [f32; 3] {
@@ -139,18 +168,82 @@ impl Hot {
 }
 
 /// Cold configuration, touched on recentre and on setting knobs.
+/// The rarely-written settings, read on every frame.
+///
+/// These used to live behind a mutex, and `state()` took it once per frame on
+/// the render thread. Uncontended that is cheap, and cheap is not the point: a
+/// lock means the renderer can be made to *wait* for whichever thread holds it,
+/// and on a phone whose scheduler can park a thread mid-critical-section that
+/// is a dropped frame arriving through no fault of the renderer's.
+///
+/// They are written by hand three times a session and read a hundred and twenty
+/// times a second, so they are published through the same sequence lock the
+/// poses use. Readers never block. Writers still exclude each other — through
+/// [`Tracker::writer`], which is never touched on the frame path.
 struct Cold {
-    pointer: Pointer,
+    /// Bumped around every write; see [`Hot::publish`].
+    seq: AtomicU32,
+    /// `[head_ref, phone_ref]` of the pointer, then its distance.
+    pointer_head_ref: [AtomicU32; 4],
+    pointer_phone_ref: [AtomicU32; 4],
+    pointer_distance: AtomicU32,
     /// How far ahead to extrapolate, in seconds.
-    lookahead_s: f32,
+    lookahead_s: AtomicU32,
     /// Reference heading as a unit `(cos, sin)` about world Y.
     ///
     /// Recentring cancels **heading only**. Pitch and roll stay as the device
     /// reports them, which keeps them gravity-anchored. A full-orientation
     /// recentre folds the reference pitch into the yaw axis, and the scene then
-    /// tilts as you pan — the workspace ends up visibly angled. This mirrors the
-    /// semantics the Kotlin side used before the maths moved down here.
-    ref_yaw: (f32, f32),
+    /// tilts as you pan — the workspace ends up visibly angled.
+    ref_yaw: [AtomicU32; 2],
+}
+
+impl Default for Cold {
+    /// Zero is not the identity here, and assuming it was cost a debugging
+    /// session: a reference heading of `(0, 0)` is not "no rotation" but a
+    /// degenerate one, and recentring against it produces a quaternion of
+    /// nothing. The identity heading is `(cos, sin) = (1, 0)`.
+    fn default() -> Cold {
+        let bits = |v: f32| AtomicU32::new(v.to_bits());
+        let identity = || [bits(1.0), bits(0.0), bits(0.0), bits(0.0)];
+        let pointer = Pointer::default();
+        Cold {
+            seq: AtomicU32::new(0),
+            pointer_head_ref: identity(),
+            pointer_phone_ref: identity(),
+            pointer_distance: bits(pointer.distance),
+            lookahead_s: bits(0.0),
+            ref_yaw: [bits(1.0), bits(0.0)],
+        }
+    }
+}
+
+impl Cold {
+    /// Everything the frame path needs, read without blocking.
+    fn snapshot(&self, forward: [f32; 3]) -> (Pointer, f32, (f32, f32)) {
+        Hot::consistent(&self.seq, || {
+            let quat = |slot: &[AtomicU32; 4]| {
+                let mut q = [0f32; 4];
+                for (i, a) in slot.iter().enumerate() {
+                    q[i] = f32::from_bits(a.load(Ordering::Relaxed));
+                }
+                q
+            };
+            (
+                Pointer {
+                    head_ref: quat(&self.pointer_head_ref),
+                    phone_ref: quat(&self.pointer_phone_ref),
+                    distance: f32::from_bits(self.pointer_distance.load(Ordering::Relaxed)),
+                    forward,
+                },
+                f32::from_bits(self.lookahead_s.load(Ordering::Relaxed)),
+                (
+                    f32::from_bits(self.ref_yaw[0].load(Ordering::Relaxed)),
+                    f32::from_bits(self.ref_yaw[1].load(Ordering::Relaxed)),
+                ),
+            )
+        })
+    }
 }
 
 /// Marks [`Hot::pending_mode`] as carrying a request rather than being idle.
@@ -226,7 +319,10 @@ pub struct DeviceInfo {
 
 pub struct Tracker {
     hot: Arc<Hot>,
-    cold: Mutex<Cold>,
+    cold: Cold,
+    /// Serialises the rare configuration writers against each other. Never
+    /// taken on the frame path — see [`Cold`].
+    writer: Mutex<()>,
     stop: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
     info: DeviceInfo,
@@ -315,11 +411,8 @@ impl Tracker {
 
         Ok(Tracker {
             hot,
-            cold: Mutex::new(Cold {
-                pointer: Pointer::default(),
-                lookahead_s: 0.020,
-                ref_yaw: (1.0, 0.0),
-            }),
+            cold: Cold::default(),
+            writer: Mutex::new(()),
             stop,
             reader: Some(reader),
             info,
@@ -393,24 +486,45 @@ impl Tracker {
     pub fn recentre(&self) {
         let head = Hot::load_quat(&self.hot.head_seq, &self.hot.head);
         let phone = Hot::load_quat(&self.hot.phone_seq, &self.hot.phone);
-        if let Ok(mut c) = self.cold.lock() {
-            c.ref_yaw = yaw_twist(head);
+        let _writing = self.writer.lock();
+        let (cos, sin) = yaw_twist(head);
+        Hot::publish(&self.cold.seq, || {
+            self.cold.ref_yaw[0].store(cos.to_bits(), Ordering::Relaxed);
+            self.cold.ref_yaw[1].store(sin.to_bits(), Ordering::Relaxed);
             // The head handed to the pointer is already recentred, so its own
             // head reference stays the identity.
-            c.pointer.recentre([1.0, 0.0, 0.0, 0.0], phone);
-        }
+            for (a, v) in self
+                .cold
+                .pointer_head_ref
+                .iter()
+                .zip([1.0f32, 0.0, 0.0, 0.0])
+            {
+                a.store(v.to_bits(), Ordering::Relaxed);
+            }
+            for (a, v) in self.cold.pointer_phone_ref.iter().zip(phone) {
+                a.store(v.to_bits(), Ordering::Relaxed);
+            }
+        });
     }
 
     pub fn set_lookahead_s(&self, seconds: f32) {
-        if let Ok(mut c) = self.cold.lock() {
-            c.lookahead_s = seconds.clamp(0.0, 0.1);
-        }
+        let _writing = self.writer.lock();
+        let clamped = seconds.clamp(0.0, 0.1);
+        Hot::publish(&self.cold.seq, || {
+            self.cold
+                .lookahead_s
+                .store(clamped.to_bits(), Ordering::Relaxed);
+        });
     }
 
     pub fn set_distance(&self, distance: f32) {
-        if let Ok(mut c) = self.cold.lock() {
-            c.pointer.distance = distance.max(0.1);
-        }
+        let _writing = self.writer.lock();
+        let clamped = distance.max(0.1);
+        Hot::publish(&self.cold.seq, || {
+            self.cold
+                .pointer_distance
+                .store(clamped.to_bits(), Ordering::Relaxed);
+        });
     }
 
     /// One snapshot for the current frame.
@@ -419,15 +533,15 @@ impl Tracker {
         let gyro = Hot::load_vec3(&self.hot.gyro);
         let phone = Hot::load_quat(&self.hot.phone_seq, &self.hot.phone);
 
-        let (relative, lookahead, cursor) = match self.cold.lock() {
-            Ok(c) => {
-                // Heading-only recentring: pitch and roll stay gravity-anchored,
-                // so panning cannot tilt the workspace.
-                let relative = recentre_yaw(head, c.ref_yaw);
-                (relative, c.lookahead_s, c.pointer.cursor(relative, phone))
-            }
-            Err(_) => (head, 0.0, None),
-        };
+        // No lock on this path. `state()` is called once per rendered frame and
+        // at the pose rate besides; a mutex here means the renderer can be made
+        // to wait for another thread, which is a dropped frame it did nothing
+        // to deserve.
+        let (pointer, lookahead, ref_yaw) = self.cold.snapshot(POINTER_FORWARD);
+        // Heading-only recentring: pitch and roll stay gravity-anchored, so
+        // panning cannot tilt the workspace.
+        let relative = recentre_yaw(head, ref_yaw);
+        let cursor = pointer.cursor(relative, phone);
 
         // Extrapolating the recentred orientation rather than the raw one keeps
         // the prediction in the frame the renderer actually draws in.
@@ -459,6 +573,13 @@ impl Drop for Tracker {
         }
     }
 }
+
+/// Which phone axis points forward for the pointer: the top edge, which is what
+/// pointing the phone like a wand feels like.
+///
+/// A constant rather than a stored field, because nothing changes it and a
+/// value nobody writes does not need publishing.
+const POINTER_FORWARD: [f32; 3] = [0.0, 1.0, 0.0];
 
 /// How many times a reader retries a torn quaternion before taking what is
 /// there. The writer holds the lock for four stores, so losing twice in a row

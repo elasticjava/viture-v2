@@ -30,8 +30,7 @@
 //! hardware is good at, split across cores when there is enough of it to be
 //! worth the threads.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// How a file maps onto geometry, and how confidently that is known.
@@ -767,29 +766,74 @@ fn infer_serial(blob: &[u8], meta: &[u32], out: &mut [u32]) {
 }
 
 fn infer_threaded(blob: &[u8], meta: &[u32], out: &mut [u32], threads: usize) {
-    // `chunks_mut` hands out disjoint slices, so the borrow checker already
-    // knows no two threads can write the same element and there is nothing here
-    // to get wrong by hand.
-    let queue = Mutex::new(out.chunks_mut(CHUNK).enumerate().collect::<Vec<_>>());
-    let queue = &queue;
+    // Work is claimed with one atomic add and no lock at all.
+    //
+    // A mutex here would be uncontended almost always and would cost tens of
+    // nanoseconds against a chunk's tens of microseconds, so it is not the
+    // arithmetic that argues against it. It is that a lock lets one thread
+    // block another, and the threads doing this work sit on cores of three
+    // different speeds — a slow core descheduled while holding the queue would
+    // stop the fast one from finding its next chunk.
+    let count = out.len();
+    let cursor = AtomicUsize::new(0);
+    let chunks = count.div_ceil(CHUNK);
+    let base = Shared(out.as_mut_ptr());
+    let cursor = &cursor;
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(move || loop {
-                // Taking one chunk under a lock costs tens of nanoseconds
-                // against a chunk's tens of microseconds of work, so the
-                // contention is not worth engineering away.
-                let Some((index, chunk)) = queue.lock().ok().and_then(|mut q| q.pop()) else {
+                let chunk = cursor.fetch_add(1, Ordering::Relaxed);
+                if chunk >= chunks {
                     return;
-                };
-                let base = index * CHUNK;
-                for (offset, slot) in chunk.iter_mut().enumerate() {
-                    let e = entry(blob, meta, base + offset).expect("validated by the caller");
-                    *slot = infer(e.name, e.mode, e.width, e.height).pack();
+                }
+                let start = chunk * CHUNK;
+                let end = (start + CHUNK).min(count);
+                for i in start..end {
+                    let e = entry(blob, meta, i).expect("validated by the caller");
+                    let word = infer(e.name, e.mode, e.width, e.height).pack();
+                    // Safety: each chunk index is handed out once, by an atomic
+                    // increment, so exactly one thread writes any given `i` and
+                    // no thread reads what another writes. `i < count ==
+                    // out.len()`, bounded above. The scope joins every thread
+                    // before `out` is used again.
+                    unsafe { base.put(i, word) };
                 }
             });
         }
     });
 }
+
+/// A pointer into the output, shared across the workers.
+///
+/// Raw rather than a slice because the split is dynamic: which thread gets
+/// which chunk is decided at run time by an atomic counter, and no borrow can
+/// express that. The disjointness is still provable — one index, one claimant —
+/// and the argument is written out at the write itself.
+#[derive(Clone, Copy)]
+struct Shared(*mut u32);
+
+impl Shared {
+    /// Writes one element.
+    ///
+    /// A method rather than a field access, and that is load-bearing: closures
+    /// capture individual fields, so `base.0` inside one captures the bare
+    /// pointer and the `Send` wrapper around it never applies. Going through a
+    /// method captures the wrapper, which is the thing that carries the safety
+    /// argument.
+    ///
+    /// # Safety
+    /// `index` must be within the slice this was made from, and no other thread
+    /// may touch that element for the lifetime of the call.
+    #[inline]
+    unsafe fn put(self, index: usize, value: u32) {
+        self.0.add(index).write(value);
+    }
+}
+
+// Safety: the pointer is only ever written through disjoint indices, one per
+// atomic claim, and never read across threads.
+unsafe impl Send for Shared {}
+unsafe impl Sync for Shared {}
 
 /// Reads a whole listing.
 ///
