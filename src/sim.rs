@@ -216,6 +216,13 @@ impl Default for DeviceState {
     }
 }
 
+/// Every command the driver sent, as message id and payload.
+///
+/// Shared, because the interesting ones are sent on the way *out* and a tracker
+/// takes the device by value: once a session has ended there is nothing left to
+/// ask. A handle taken beforehand outlives it.
+pub type CommandLog = std::sync::Arc<std::sync::Mutex<Vec<(u16, Vec<u8>)>>>;
+
 /// A transport that answers like the glasses do.
 ///
 /// Time is a counter rather than a clock: `recv` advances it by one sampling
@@ -234,13 +241,8 @@ pub struct Simulated {
     paced: bool,
     /// When the first paced sample went out, so simulated and real time agree.
     started: Option<std::time::Instant>,
-    /// Every command the driver sent, for asserting on.
-    ///
-    /// Shared rather than owned, because the interesting commands are the ones
-    /// sent on the way *out*: a tracker takes the device by value, and by the
-    /// time a session has ended there is nothing left to ask. A handle taken
-    /// before it is handed over outlives it.
-    pub sent: std::sync::Arc<std::sync::Mutex<Vec<(u16, Vec<u8>)>>>,
+    /// Every command the driver sent, for asserting on. See [`CommandLog`].
+    pub sent: CommandLog,
 }
 
 impl Simulated {
@@ -274,7 +276,7 @@ impl Simulated {
     }
 
     /// A handle on the command log that outlives the device.
-    pub fn log(&self) -> std::sync::Arc<std::sync::Mutex<Vec<(u16, Vec<u8>)>>> {
+    pub fn log(&self) -> CommandLog {
         std::sync::Arc::clone(&self.sent)
     }
 
