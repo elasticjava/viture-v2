@@ -301,6 +301,112 @@ pub const PANEL_DIAGONAL_FOV_DEG: f32 = 50.0;
 /// diagonal. Checked against [`vertical_fov`] in the tests rather than trusted.
 pub const DEFAULT_FOV_DEG: f32 = 25.76;
 
+/// A pair of glasses this driver knows the optics of.
+///
+/// The field of view cannot be worked out from inside the software. There is no
+/// sensor pointed at the virtual image and nothing on the wire that reports it;
+/// it is a property of lenses. What the software *can* do is recognise which
+/// glasses it is talking to and look the number up, which is what this is.
+///
+/// The per-eye resolution is here too, and it is not decoration: the Beast is
+/// 1920x1200 where everything else is 1920x1080, and a renderer that assumes
+/// 16:9 draws a stretched world on it. That part is also readable from the
+/// display itself, which is the better source when the two disagree — the panel
+/// knows its own shape and this table is a copy.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Model {
+    /// USB product id, which is how the glasses are told apart.
+    pub product_id: u16,
+    pub name: &'static str,
+    /// Diagonal field of view in degrees, as the manufacturer publishes it.
+    pub diagonal_fov_deg: f32,
+    pub eye_width: u32,
+    pub eye_height: u32,
+    /// Whether these numbers were checked against the hardware or taken from
+    /// the manufacturer. Worth carrying: a published figure is a claim, and the
+    /// one model measured here already disagreed with its own datasheet about
+    /// refresh rate.
+    pub verified: bool,
+}
+
+/// The glasses this driver has numbers for.
+///
+/// Only the Pro 2 has been in front of it. The rest are from VITURE's published
+/// specifications and are marked accordingly — they are far better than
+/// pretending every pair is a Pro 2, and they are not measurements.
+///
+/// Product ids beyond the Pro 2's are not known, so those entries are matched
+/// by nothing yet and exist to be filled in the moment one of these is
+/// attached: the id is logged on every connection for exactly that reason.
+pub const KNOWN_MODELS: [Model; 4] = [
+    Model {
+        product_id: 0x1301,
+        name: "VITURE Pro 2",
+        diagonal_fov_deg: 50.0,
+        eye_width: 1920,
+        eye_height: 1080,
+        verified: true,
+    },
+    Model {
+        product_id: 0,
+        name: "VITURE Luma",
+        diagonal_fov_deg: 52.0,
+        eye_width: 1920,
+        eye_height: 1080,
+        verified: false,
+    },
+    Model {
+        product_id: 0,
+        name: "VITURE Luma Ultra",
+        diagonal_fov_deg: 52.0,
+        eye_width: 1920,
+        eye_height: 1080,
+        verified: false,
+    },
+    Model {
+        product_id: 0,
+        // 1920x1200 an eye, which is 16:10 and not 16:9. The one entry in this
+        // table whose shape differs, and the reason the table carries shapes.
+        name: "VITURE Beast",
+        diagonal_fov_deg: 58.0,
+        eye_width: 1920,
+        eye_height: 1200,
+        verified: false,
+    },
+];
+
+/// The glasses with this product id, if they are known.
+///
+/// A product id of zero never matches, which is what keeps the unverified
+/// entries above from being chosen by accident.
+pub fn model_for(product_id: u16) -> Option<&'static Model> {
+    if product_id == 0 {
+        return None;
+    }
+    KNOWN_MODELS.iter().find(|m| m.product_id == product_id)
+}
+
+/// The vertical field of view to render at, for glasses whose product id is
+/// `product_id` and whose panel is `eye_width` by `eye_height` per eye.
+///
+/// Both halves of the answer come from the best source available, which is not
+/// the same source for each. The **shape** comes from the panel, because the
+/// panel knows it and reports it; the **angle** comes from the table, because
+/// nothing reports it. Unknown glasses get the Pro 2's angle with their own
+/// shape, which is wrong by a few degrees of scale rather than wrong by a
+/// stretch — the mistake nobody notices instead of the one everybody does.
+pub fn fov_for_panel(product_id: u16, eye_width: u32, eye_height: u32) -> f32 {
+    let diagonal = model_for(product_id)
+        .map(|m| m.diagonal_fov_deg)
+        .unwrap_or(PANEL_DIAGONAL_FOV_DEG);
+    let aspect = if eye_height > 0 {
+        eye_width as f32 / eye_height as f32
+    } else {
+        16.0 / 9.0
+    };
+    vertical_fov(diagonal, aspect)
+}
+
 /// The vertical field of view of a screen quoted by its diagonal.
 ///
 /// The half-height of a rectangle is `1 / sqrt(1 + aspect²)` of its
@@ -884,6 +990,42 @@ pub fn gaze_uv(head: [f32; 4]) -> [f32; 2] {
 // validates its pointer and capacity: a wrong stride on the caller's side
 // should produce a negative return, not a half-written buffer.
 // ---------------------------------------------------------------------------
+
+/// The vertical field of view to render at, in degrees, for these glasses and
+/// this panel.
+///
+/// The shape comes from the panel because the panel knows it; the angle comes
+/// from a table because nothing reports it. Glasses this build has never heard
+/// of get the Pro 2's angle with their own shape — wrong by a little scale
+/// rather than by a stretch.
+#[no_mangle]
+pub extern "C" fn xr_fov_for_panel(product_id: u32, eye_width: u32, eye_height: u32) -> f32 {
+    fov_for_panel(product_id as u16, eye_width, eye_height)
+}
+
+/// Writes what is known about the glasses with this product id, for logging:
+/// `[diagonal_fov_deg, eye_width, eye_height, verified]`. Returns 0 when they
+/// are recognised and -1 when they are not, in which case nothing is written.
+///
+/// # Safety
+/// `out` must point to four writable, aligned `f32`s.
+#[no_mangle]
+pub unsafe extern "C" fn xr_model_info(product_id: u32, out: *mut f32) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    let Some(model) = model_for(product_id as u16) else {
+        return -1;
+    };
+    let slice = std::slice::from_raw_parts_mut(out, 4);
+    slice.copy_from_slice(&[
+        model.diagonal_fov_deg,
+        model.eye_width as f32,
+        model.eye_height as f32,
+        f32::from(u8::from(model.verified)),
+    ]);
+    0
+}
 
 /// Vertices [`xr_pano_mesh`] will write, for sizing the buffer.
 #[no_mangle]
@@ -1703,6 +1845,73 @@ mod tests {
     fn project(m: &[f32; 16], p: [f32; 3]) -> [f32; 2] {
         let v = project_raw(m, p);
         [v[0] / v[3], v[1] / v[3]]
+    }
+
+    // -- which glasses ------------------------------------------------------
+
+    #[test]
+    fn the_pro_2_is_the_one_that_was_actually_measured() {
+        let pro2 = model_for(0x1301).expect("the Pro 2 should be known");
+        assert_eq!(pro2.diagonal_fov_deg, PANEL_DIAGONAL_FOV_DEG);
+        assert!(
+            pro2.verified,
+            "the Pro 2 is the model this was built against"
+        );
+        // And it is the only one, which is the honest state of affairs. If a
+        // second becomes verified, that is a measurement somebody took and this
+        // line should be updated deliberately rather than drift.
+        assert_eq!(KNOWN_MODELS.iter().filter(|m| m.verified).count(), 1);
+    }
+
+    #[test]
+    fn glasses_nobody_has_plugged_in_cannot_be_matched_by_accident() {
+        // The unverified entries carry a product id of zero because nobody has
+        // read theirs off a bus. Zero must never match, or an unrecognised pair
+        // would silently be treated as whichever placeholder came first.
+        assert_eq!(model_for(0), None);
+        assert_eq!(model_for(0xFFFF), None);
+        for model in KNOWN_MODELS.iter().filter(|m| !m.verified) {
+            assert_eq!(
+                model.product_id, 0,
+                "{} claims an id nobody read",
+                model.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_panel_decides_the_shape_and_the_table_decides_the_angle() {
+        // The two halves of the answer come from different places on purpose.
+        // A wrong angle scales the world; a wrong shape stretches it, and only
+        // one of those is noticed. So the shape is taken from the panel even
+        // for glasses the table has never heard of.
+        let known_16_9 = fov_for_panel(0x1301, 1920, 1080);
+        let unknown_16_9 = fov_for_panel(0xBEEF, 1920, 1080);
+        assert_eq!(known_16_9, unknown_16_9, "same optics, same answer");
+
+        // A 16:10 panel is a different vertical angle for the same diagonal,
+        // whether or not the glasses are recognised.
+        let unknown_16_10 = fov_for_panel(0xBEEF, 1920, 1200);
+        assert!(
+            unknown_16_10 > unknown_16_9,
+            "a taller panel spans more vertical angle for the same diagonal",
+        );
+
+        // The Beast is both wider in angle and taller in shape, so it must
+        // differ from the Pro 2 on both counts once its id is known.
+        let beast = KNOWN_MODELS
+            .iter()
+            .find(|m| m.name.contains("Beast"))
+            .unwrap();
+        assert!(beast.diagonal_fov_deg > 50.0);
+        assert_eq!(beast.eye_height, 1200);
+    }
+
+    #[test]
+    fn a_panel_that_reports_nothing_falls_back_rather_than_dividing_by_zero() {
+        let fallback = fov_for_panel(0x1301, 0, 0);
+        assert!(fallback.is_finite() && fallback > 0.0);
+        assert!((fallback - DEFAULT_FOV_DEG).abs() < 0.1, "{fallback}");
     }
 
     // -- bounded spheres ----------------------------------------------------
