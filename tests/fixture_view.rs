@@ -82,7 +82,9 @@ fn surface(projection: Projection) -> (Vec<f32>, Vec<[usize; 3]>) {
         let mut indices = vec![0u16; index_count(RINGS, SECTORS)];
         sphere_indices(RINGS, SECTORS, &mut indices).expect("indices");
         let triangles = indices
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|t| [t[0] as usize, t[1] as usize, t[2] as usize])
             .collect();
         (mesh, triangles)
