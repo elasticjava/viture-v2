@@ -63,6 +63,9 @@ struct Hot {
     reader_errno: AtomicU32,
     /// A display mode waiting to be sent, tagged with [`PENDING_SET`].
     pending_mode: AtomicU32,
+    /// The mode the panel was in when this session opened, so it can be left
+    /// that way. Zero when it could not be read.
+    entry_display_mode: AtomicU32,
     /// Events seen that were neither pose nor raw — a mapping gap would show up
     /// here rather than as silence.
     other_events: AtomicU64,
@@ -398,6 +401,13 @@ impl Tracker {
         }
 
         let hot = Arc::new(Hot::default());
+        // Remember what the panel was in, so the session can leave it that way.
+        // Read from `info` rather than asked again: the command path is about
+        // to be handed to the reader thread.
+        if info.display_mode > 0 {
+            hot.entry_display_mode
+                .store(info.display_mode as u32, Ordering::Relaxed);
+        }
         Hot::store_quat(&hot.head_seq, &hot.head, [1.0, 0.0, 0.0, 0.0]);
         Hot::store_quat(&hot.phone_seq, &hot.phone, [1.0, 0.0, 0.0, 0.0]);
 
@@ -730,6 +740,33 @@ fn read_loop<T: Transport>(
     }
     hot.reader_alive.store(false, Ordering::Release);
     let _ = dev.set_imu(Streams::OFF, Rate::Hz120);
+
+    // Leave the panel as it was found.
+    //
+    // Side-by-side is a rendering arrangement, not a display setting: the panel
+    // cuts every frame down the middle and sends half to each eye, which is
+    // right only while something is deliberately drawing a stereo pair. Once
+    // this session ends, nothing is — and every ordinary picture on that
+    // display arrives halved. The wearer gets the left half of a desktop in one
+    // eye and the right half in the other, with no way from inside the glasses
+    // to work out why or how to undo it.
+    //
+    // The driver is the right place for this and the callers above are not.
+    // There are several ways for a session to end — a clean close, an activity
+    // destroyed, a stream that died — and asking each of them to remember is
+    // asking for the one that forgets. This is the layer that owns the device,
+    // so it is the layer that puts it back.
+    //
+    // Not policy, and deliberately not: it restores the mode that was there at
+    // open rather than imposing 2D. A session that began in side-by-side leaves
+    // it in side-by-side.
+    let entry_mode = hot.entry_display_mode.load(Ordering::Relaxed);
+    if entry_mode != 0 {
+        let now = dev.get_u8(crate::msg::DISPLAY_MODE).unwrap_or(0);
+        if now != 0 && now != entry_mode as u8 {
+            let _ = dev.set_display_mode_raw(entry_mode as u8);
+        }
+    }
 }
 
 /// Extrapolates an orientation forward by `dt` seconds at angular rate

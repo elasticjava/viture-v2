@@ -9,6 +9,7 @@
 //! microseconds and gives the same answer every run.
 
 use viture_v2::sim::{angle_between, Failing, Simulated, Still, TurnThenStop, Turning};
+use viture_v2::xr::Tracker;
 use viture_v2::{msg, Device, Event, Rate, Streams};
 
 /// Degrees, for assertions that are easier to judge than radians.
@@ -44,7 +45,8 @@ fn starting_the_imu_reaches_the_device() {
 
     // And it went out as one IMU_CTRL frame, not as something the device merely
     // tolerated.
-    let sent = &device.transport().sent;
+    let log = device.transport().log();
+    let sent = &*log.lock().unwrap();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].0, msg::IMU_CTRL);
 }
@@ -325,4 +327,79 @@ mod pipeline {
             );
         }
     }
+}
+
+/// The panel is left the way the session found it.
+///
+/// Side-by-side is a rendering arrangement, not a display setting: the panel
+/// cuts every frame in half and sends one to each eye, which is correct only
+/// while something is deliberately drawing a stereo pair. When the session ends
+/// nothing is, and every ordinary picture on that display arrives halved — the
+/// wearer sees the left half of a desktop in one eye and the right half in the
+/// other, with no way from inside the glasses to work out why.
+///
+/// It happened during testing on real hardware, and the shape of it is what
+/// puts this in the driver rather than in a caller: the panel was switched, the
+/// thing that was going to draw stereo then failed to start, and the teardown
+/// that would have fixed it belonged to the thing that never ran. There are
+/// several ways for a session to end, and asking each of them to remember is
+/// asking for the one that forgets.
+#[test]
+fn the_panel_is_left_in_the_mode_the_session_found_it_in() {
+    use viture_v2::sim::measured;
+
+    let mut device = Simulated::still();
+    // A session that begins with the panel already splitting frames.
+    device.set_display_mode(measured::MODE_SIDE_BY_SIDE);
+
+    let log = device.log();
+    let tracker = Tracker::with_transport(Device::new(device), Rate::Hz120).expect("tracker");
+    // Something asks for 2D mid-session, as the renderer does when it is not
+    // drawing a stereo pair.
+    tracker.request_display_mode(measured::MODE_2D);
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    drop(tracker);
+    let sent = log.lock().unwrap().clone();
+
+    // The last word on the panel must put back what was there, not leave the
+    // mode whoever spoke last happened to want.
+    let modes: Vec<u8> = sent
+        .iter()
+        .filter(|(id, _)| *id == viture_v2::msg::SET_DISPLAY_MODE)
+        .filter_map(|(_, payload)| payload.first().copied())
+        .collect();
+    assert!(
+        modes.contains(&measured::MODE_2D),
+        "the mid-session request never reached the panel: {modes:02X?}",
+    );
+    assert_eq!(
+        modes.last().copied(),
+        Some(measured::MODE_SIDE_BY_SIDE),
+        "the session ended without putting the panel back: {modes:02X?}",
+    );
+}
+
+/// And a session that changes nothing says nothing.
+///
+/// Switching the mode renegotiates the video link, which from inside the
+/// glasses is a black flash. Doing that on the way out of a session that never
+/// touched the panel would be a flash for no reason at all.
+#[test]
+fn a_session_that_left_the_panel_alone_does_not_speak_to_it_on_the_way_out() {
+    let device = Simulated::still();
+    let log = device.log();
+    let tracker = Tracker::with_transport(Device::new(device), Rate::Hz120).expect("tracker");
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    drop(tracker);
+    let modes: Vec<u8> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(id, _)| *id == viture_v2::msg::SET_DISPLAY_MODE)
+        .filter_map(|(_, payload)| payload.first().copied())
+        .collect();
+    assert!(
+        modes.is_empty(),
+        "the panel was spoken to for no reason: {modes:02X?}"
+    );
 }

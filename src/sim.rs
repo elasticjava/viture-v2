@@ -235,7 +235,12 @@ pub struct Simulated {
     /// When the first paced sample went out, so simulated and real time agree.
     started: Option<std::time::Instant>,
     /// Every command the driver sent, for asserting on.
-    pub sent: Vec<(u16, Vec<u8>)>,
+    ///
+    /// Shared rather than owned, because the interesting commands are the ones
+    /// sent on the way *out*: a tracker takes the device by value, and by the
+    /// time a session has ended there is nothing left to ask. A handle taken
+    /// before it is handed over outlives it.
+    pub sent: std::sync::Arc<std::sync::Mutex<Vec<(u16, Vec<u8>)>>>,
 }
 
 impl Simulated {
@@ -248,7 +253,7 @@ impl Simulated {
             stalled: false,
             paced: false,
             started: None,
-            sent: Vec::new(),
+            sent: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -266,6 +271,17 @@ impl Simulated {
 
     pub fn state(&self) -> DeviceState {
         self.state
+    }
+
+    /// A handle on the command log that outlives the device.
+    pub fn log(&self) -> std::sync::Arc<std::sync::Mutex<Vec<(u16, Vec<u8>)>>> {
+        std::sync::Arc::clone(&self.sent)
+    }
+
+    /// Starts the session with the panel already in this mode, which is how a
+    /// pair of glasses that was last used in side-by-side comes back.
+    pub fn set_display_mode(&mut self, mode: u8) {
+        self.state.display_mode = mode;
     }
 
     /// Makes each sample take the wall time it would on the device.
@@ -336,7 +352,9 @@ impl Simulated {
 impl Transport for Simulated {
     fn send(&mut self, frame: &[u8]) -> Result<()> {
         let parsed = crate::parse(frame)?;
-        self.sent.push((parsed.msg_id, parsed.payload.to_vec()));
+        if let Ok(mut log) = self.sent.lock() {
+            log.push((parsed.msg_id, parsed.payload.to_vec()));
+        }
 
         match parsed.msg_id {
             msg::IMU_CTRL => {
