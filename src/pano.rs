@@ -13,11 +13,17 @@
 //!
 //! # Conventions
 //!
-//! Right-handed world space: `+X` right, `+Y` up, `−Z` forward. Equirectangular
-//! texture space: `u` runs left to right, `v` runs top to bottom, so `v = 0` is
-//! the zenith. The image centre `(0.5, 0.5)` sits straight ahead at `−Z`, which
-//! is where a viewer looks when the video starts, and increasing `u` sweeps to
-//! the right.
+//! Right-handed world space: `+X` right, `+Y` up, `−Z` forward.
+//!
+//! Texture coordinates follow OpenGL rather than the image: `u` runs left to
+//! right, and `v` runs *bottom to top*, so `v = 1` is the zenith. That is the
+//! convention `SurfaceTexture.getTransformMatrix` expects — it maps GL-style
+//! coordinates onto the decoder's buffer and carries whatever vertical flip the
+//! buffer needs. Emitting image-style coordinates here instead flips the sphere,
+//! and a 360° video renders upside down.
+//!
+//! The image centre `(0.5, 0.5)` sits straight ahead at `−Z`, which is where a
+//! viewer looks when the video starts, and increasing `u` sweeps to the right.
 //!
 //! The sphere is wound so that its triangles are counter-clockwise *seen from
 //! the centre*. Back-face culling can therefore stay on, which halves the
@@ -131,9 +137,12 @@ pub fn sphere_mesh(rings: u32, sectors: u32, radius: f32, out: &mut [f32]) -> Op
 
     let mut w = 0;
     for ring in 0..=rings {
-        let v = ring as f32 / rings as f32;
-        // Latitude, +π/2 at the zenith so that v = 0 is up.
-        let lat = (0.5 - v) * std::f32::consts::PI;
+        // Rows run from the zenith down, so that consecutive vertices are
+        // adjacent in memory the way the index buffer walks them.
+        let down = ring as f32 / rings as f32;
+        // Texture space is bottom-up: the zenith is v = 1.
+        let v = 1.0 - down;
+        let lat = (0.5 - down) * std::f32::consts::PI;
         let (sin_lat, cos_lat) = lat.sin_cos();
         let y = radius * sin_lat;
         // Radius of this latitude's circle.
@@ -430,6 +439,10 @@ mod tests {
         (verts, idx)
     }
 
+    fn verts_of() -> Vec<f32> {
+        build().0
+    }
+
     fn pos(verts: &[f32], i: u16) -> [f32; 3] {
         let o = i as usize * VERTEX_FLOATS;
         [verts[o], verts[o + 1], verts[o + 2]]
@@ -473,22 +486,30 @@ mod tests {
     }
 
     #[test]
-    fn zenith_is_up_and_nadir_is_down() {
-        let (verts, _) = build();
-        let top = verts
-            .as_chunks::<VERTEX_FLOATS>()
-            .0
-            .iter()
-            .find(|c| c[4] == 0.0)
-            .unwrap();
-        let bottom = verts
-            .as_chunks::<VERTEX_FLOATS>()
-            .0
-            .iter()
-            .find(|c| c[4] == 1.0)
-            .unwrap();
-        assert!((top[1] - 1.0).abs() < 1e-5, "top y {}", top[1]);
-        assert!((bottom[1] + 1.0).abs() < 1e-5, "bottom y {}", bottom[1]);
+    fn the_top_of_the_texture_is_the_zenith() {
+        // Texture space is bottom-up, so v = 1 must be overhead. Backwards is a
+        // plausible-looking convention either way, and it renders the whole
+        // panorama upside down.
+        let rows = |target: f32| {
+            *verts_of()
+                .as_chunks::<VERTEX_FLOATS>()
+                .0
+                .iter()
+                .find(|c| c[4] == target)
+                .unwrap()
+        };
+        let up = rows(1.0);
+        let down = rows(0.0);
+        assert!(
+            (up[1] - 1.0).abs() < 1e-5,
+            "v = 1 should be up, y = {}",
+            up[1]
+        );
+        assert!(
+            (down[1] + 1.0).abs() < 1e-5,
+            "v = 0 should be down, y = {}",
+            down[1]
+        );
     }
 
     #[test]
