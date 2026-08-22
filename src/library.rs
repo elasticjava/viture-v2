@@ -30,8 +30,8 @@
 //! hardware is good at, split across cores when there is enough of it to be
 //! worth the threads.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// How a file maps onto geometry, and how confidently that is known.
@@ -530,12 +530,40 @@ impl Plan {
     };
 }
 
-static PLAN: OnceLock<Plan> = OnceLock::new();
+/// The measured plan, packed into a word so it can be read without a lock on
+/// the path that reads it every batch.
+///
+/// `0` means nothing has been measured yet, which reads as [`Plan::SERIAL`] —
+/// the conservative default, and the right one to be using while a
+/// re-measurement is in flight.
+static PLAN: AtomicU64 = AtomicU64::new(0);
 static CALIBRATING: AtomicBool = AtomicBool::new(false);
+
+fn pack_plan(plan: Plan) -> u64 {
+    let threshold = plan.threshold.min(u32::MAX as usize) as u64;
+    // The low bit distinguishes "measured" from "not yet", so a measured plan
+    // of serial-at-every-size is not mistaken for an absent one.
+    1 | (threshold << 1) | ((plan.threads.min(0xFF) as u64) << 33)
+}
+
+fn unpack_plan(word: u64) -> Option<Plan> {
+    if word & 1 == 0 {
+        return None;
+    }
+    let threshold = ((word >> 1) & 0xFFFF_FFFF) as usize;
+    Some(Plan {
+        threshold: if threshold == u32::MAX as usize {
+            usize::MAX
+        } else {
+            threshold
+        },
+        threads: ((word >> 33) & 0xFF) as usize,
+    })
+}
 
 /// The plan for this machine, or [`Plan::SERIAL`] until one has been measured.
 pub fn plan() -> Plan {
-    PLAN.get().copied().unwrap_or(Plan::SERIAL)
+    unpack_plan(PLAN.load(Ordering::Acquire)).unwrap_or(Plan::SERIAL)
 }
 
 /// Measures this machine and settles the plan, on a thread of its own.
@@ -548,17 +576,44 @@ pub fn plan() -> Plan {
 ///
 /// Calling it more than once is harmless; only the first does anything.
 pub fn start_calibration() {
-    if PLAN.get().is_some() || CALIBRATING.swap(true, Ordering::AcqRel) {
+    if unpack_plan(PLAN.load(Ordering::Acquire)).is_some() {
         return;
     }
-    // A detached thread rather than a scope: nothing waits for this, and the
-    // result is published through `PLAN` when it is ready.
-    let _ = std::thread::Builder::new()
+    remeasure();
+}
+
+/// Measures again, discarding whatever was decided before.
+///
+/// Called when the machine may have become a different machine: the charger
+/// went in or came out, or the battery saver turned itself on or off. Those
+/// change how a phone schedules and how fast it is willing to run, and a plan
+/// measured under one of them is a statement about that one.
+///
+/// On the hardware this was written for the answer turns out not to move — the
+/// same 56-to-59 nanoseconds an entry and the same four milliseconds to start
+/// eight threads, saver on or off, which was worth measuring precisely because
+/// it was not obvious. It is still re-measured, because that is a fact about
+/// one phone and the code will meet others.
+///
+/// Cheap to be wrong about and expensive to guess at, so it is neither: the
+/// measurement runs on a thread of its own and the old plan stays in force
+/// until the new one lands. Calls that arrive while one is running are dropped,
+/// so a burst of power-state changes costs one measurement rather than five.
+pub fn remeasure() {
+    if CALIBRATING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let started = std::thread::Builder::new()
         .name("library-calibrate".into())
         .spawn(|| {
             let measured = calibrate();
-            let _ = PLAN.set(measured);
+            PLAN.store(pack_plan(measured), Ordering::Release);
+            CALIBRATING.store(false, Ordering::Release);
         });
+    if started.is_err() {
+        // No thread, no measurement, and no lock left held.
+        CALIBRATING.store(false, Ordering::Release);
+    }
 }
 
 /// Works out, by measurement, the batch size at which threads start to pay.
@@ -838,6 +893,16 @@ pub unsafe extern "C" fn xr_library_infer(
 #[no_mangle]
 pub extern "C" fn xr_library_calibrate() {
     start_calibration();
+}
+
+/// Measures again, because the machine may have become a different one — the
+/// charger went in or out, or the battery saver changed its mind.
+///
+/// The previous answer stays in force until the new one lands, so this is safe
+/// to call from a broadcast receiver and returns at once.
+#[no_mangle]
+pub extern "C" fn xr_library_recalibrate() {
+    remeasure();
 }
 
 /// Writes `[threshold, threads]` — what the measurement decided, or
@@ -1235,6 +1300,47 @@ mod tests {
         if plan.threads == 1 {
             assert_eq!(plan.threshold, usize::MAX, "one thread is not a split");
         }
+    }
+
+    #[test]
+    fn a_plan_survives_being_packed_into_a_word() {
+        // The plan is read on every batch and written from a background
+        // measurement, so it lives in an atomic rather than behind a lock. The
+        // packing is where that could go quietly wrong.
+        for plan in [
+            Plan::SERIAL,
+            Plan {
+                threshold: 8192,
+                threads: 8,
+            },
+            Plan {
+                threshold: 1,
+                threads: 2,
+            },
+            Plan {
+                threshold: usize::MAX,
+                threads: 8,
+            },
+        ] {
+            assert_eq!(unpack_plan(pack_plan(plan)), Some(plan), "{plan:?}");
+        }
+        // And an unmeasured machine is distinguishable from a measured one that
+        // decided never to split — which is the same Plan, and must not read as
+        // "not measured yet" or every call would try to measure again.
+        assert_eq!(unpack_plan(0), None);
+        assert!(unpack_plan(pack_plan(Plan::SERIAL)).is_some());
+    }
+
+    #[test]
+    fn measuring_again_replaces_the_answer_rather_than_being_ignored() {
+        // The first calibration is once-only by design; a re-measurement is
+        // not, because the machine may have become a different machine.
+        start_calibration();
+        remeasure();
+        // Both return at once; neither leaves the "in flight" flag stuck, or
+        // no later power change would ever be acted on.
+        remeasure();
+        assert!(plan().threads >= 1);
     }
 
     #[test]

@@ -42,6 +42,10 @@ name = "simulated_view"
 required-features = ["render"]
 
 [[test]]
+name = "simulation_matches_hardware"
+required-features = ["sim"]
+
+[[test]]
 name = "fixture_view"
 required-features = ["render"]
 

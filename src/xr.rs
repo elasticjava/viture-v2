@@ -519,6 +519,71 @@ pub unsafe extern "C" fn xr_open(fd: i32, rate_hz: u32) -> *mut Tracker {
     }
 }
 
+/// Opens a tracker with no glasses on the other end.
+///
+/// The whole stack above the wire runs against it: the reader thread, the ring,
+/// recentring, rate estimation, prediction, and every command the host sends.
+/// What it answers with is what the hardware was measured answering — see
+/// [`crate::sim::measured`] — so a session driven this way is a session, not a
+/// demonstration.
+///
+/// This exists because the glasses are one cable and one battery, and work on
+/// everything above them should not stop when either runs out. It is also the
+/// only way to test the parts that need the head to do something specific: a
+/// person cannot turn their head at exactly 45 degrees a second for two
+/// seconds, and [`crate::sim::Turning`] can.
+///
+/// `motion` picks what the simulated head does: 0 still, 1 turning steadily,
+/// 2 turning and then stopping. `rate_hz` is accepted for symmetry with
+/// [`xr_open`] and, as on the device, is what the host *asks* for rather than
+/// what arrives — the simulation delivers at the measured rate.
+///
+/// Returns null if the simulated device refuses to start, which it does not,
+/// but the caller's error path should be the same either way.
+#[no_mangle]
+#[cfg(feature = "sim")]
+pub extern "C" fn xr_open_simulated(rate_hz: u32, motion: u32) -> *mut Tracker {
+    use crate::sim::{Simulated, Still, TurnThenStop, Turning};
+    const TURN_RATE: f32 = 45.0 * core::f32::consts::PI / 180.0;
+    let rate = match rate_hz {
+        60 => Rate::Hz60,
+        90 => Rate::Hz90,
+        240 => Rate::Hz240,
+        _ => Rate::Hz120,
+    };
+    let trajectory: Box<dyn crate::sim::Trajectory> = match motion {
+        // 45 degrees a second is a brisk but ordinary look-around, and it is
+        // the motion that shows lag.
+        1 => Box::new(Turning {
+            axis: [0.0, 1.0, 0.0],
+            rate: TURN_RATE,
+        }),
+        2 => Box::new(TurnThenStop {
+            axis: [0.0, 1.0, 0.0],
+            rate: TURN_RATE,
+            until: 2.0,
+        }),
+        _ => Box::new(Still::default()),
+    };
+    // Paced: the caller is a renderer reading a clock, and an unpaced stream
+    // would hand it a thousand poses before the first frame.
+    let device = crate::Device::new(Simulated::paced(trajectory));
+    match Tracker::with_transport(device, rate) {
+        Ok(t) => Box::into_raw(Box::new(t)),
+        Err(_) => core::ptr::null_mut(),
+    }
+}
+
+/// Whether this build can open a tracker without hardware.
+///
+/// The caller asks rather than assuming, so a release built without the
+/// simulation reports it instead of returning null from a function that looks
+/// like it should have worked.
+#[no_mangle]
+pub extern "C" fn xr_has_simulation() -> i32 {
+    i32::from(cfg!(feature = "sim"))
+}
+
 /// # Safety
 /// `t` must come from [`xr_open`] and must not be used afterwards.
 #[no_mangle]

@@ -1,0 +1,265 @@
+{
+  "comment": [
+    "What the real hardware does, measured rather than assumed.",
+    "",
+    "The simulated glasses are built from these numbers, so a test that passes",
+    "against the simulation is a test against something the device was actually",
+    "seen doing. Where a value here is wrong, the simulation is wrong in the",
+    "same direction, which is the point: it fails honestly rather than passing",
+    "against an invention.",
+    "",
+    "Every measurement carries the power state it was taken in, because on this",
+    "hardware that changes the answer. The phone was on its own battery, low,",
+    "with the battery saver on \u2014 the worst case, and the one worth pinning.",
+    "Re-measure on a charger and the timings should improve; the shapes should",
+    "not.",
+    "",
+    "Re-taking these: tools/measure_device.sh, with the glasses attached."
+  ],
+  "measuredAt": "2026-08-22T15:46:30+02:00",
+  "power": {
+    "comment": [
+      "Read every other number in this file against this one. The battery saver",
+      "turns itself on at the level the owner chose \u2014 40% here \u2014 and its policy",
+      "includes quick doze and disabling optional sensors.",
+      "",
+      "The glasses draw their power from the phone over the same cable that",
+      "carries the video, so a session on battery is a session on a battery that",
+      "is being drained twice."
+    ],
+    "batteryPercent": 8,
+    "charging": false,
+    "batterySaverOn": true,
+    "batterySaverAutoLevel": 40,
+    "batteryTemperatureCelsius": 32.6
+  },
+  "cpu": {
+    "comment": [
+      "Eight cores in three tiers, which is why splitting work evenly across",
+      "them is the wrong shape: an even split finishes when the slowest core",
+      "finishes its eighth. The maximum frequencies were not capped by the",
+      "battery saver in this reading \u2014 the low current frequencies are idle,",
+      "not a throttle \u2014 but scheduling and thermal headroom still differ, so",
+      "the split is re-measured when the power state changes rather than",
+      "decided once."
+    ],
+    "cores": 8,
+    "tiers": [
+      {
+        "cpus": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "maxHz": 1950000,
+        "role": "little"
+      },
+      {
+        "cpus": [
+          4,
+          5,
+          6
+        ],
+        "maxHz": 2600000,
+        "role": "middle"
+      },
+      {
+        "cpus": [
+          7
+        ],
+        "maxHz": 3105000,
+        "role": "big"
+      }
+    ],
+    "governor": "sched_pixel"
+  },
+  "glasses": {
+    "comment": [
+      "The USB identity the driver opens, and the pose stream it gets back.",
+      "",
+      "The pose rate is counted rather than claimed: 592 poses arrived in",
+      "4.981 seconds of the bridge's own diagnostic counter, which is 118.9 Hz.",
+      "That is the rate the prediction and the render loop have to live with,",
+      "and it is close enough to 120 that assuming 120 would have hidden it."
+    ],
+    "productName": "VITURE PRO 2 XR Glasses",
+    "usbVendorId": 13770,
+    "usbProductId": 4865,
+    "driverVersion": "30.0.00.002_20260804",
+    "trackingPath": "Gen1/2 host IMU",
+    "poseRateHz": 118.9,
+    "poseSampleCount": 592,
+    "poseSampleSeconds": 4.981
+  },
+  "display": {
+    "comment": [
+      "What Android sees when the panel is in its 2D mode, 0x31.",
+      "",
+      "The modes are the important part and the surprising part. There is no",
+      "3840-wide mode on this list: the side-by-side modes exist only after the",
+      "panel has been switched to 0x32 and has re-advertised itself, which is",
+      "why anything choosing a mode has to look again afterwards rather than",
+      "once at startup.",
+      "",
+      "And there is no mode above 60 Hz. The refresh rates on offer are 60, 30",
+      "and 20 \u2014 so a faster panel is not something this one is hiding, at least",
+      "not in this mode.",
+      "",
+      "In an extended desktop the display gets a display group and a power group",
+      "of its own, which is what lets the phone's screen sleep without taking",
+      "the glasses with it.",
+      "",
+      "The refresh rate is the open question, and the measurement says it is not",
+      "a bandwidth problem. The panel is rated for 1920x1080 at up to 120 Hz in",
+      "2D and 3840x1080 at up to 60 Hz side-by-side; DisplayPort is negotiated on",
+      "all four lanes with link training successful. So the bandwidth is there and",
+      "the panel can do it, and it is still offering 60 Hz and below.",
+      "",
+      "Which leaves the panel advertising less than it has. That is a thing it is",
+      "already known to do: the 3840-wide modes are absent until it is switched",
+      "into 0x32 and re-advertises. The mode byte has unexplored neighbours \u2014",
+      "0x41 to 0x45 \u2014 and the obvious hypothesis is that one of them is the",
+      "high-refresh mode. Untested: it needs the glasses attached."
+    ],
+    "name": "VITURE",
+    "manufacturerPnpId": "CVT",
+    "productId": 12594,
+    "manufactureDate": "2023-W32",
+    "physicalId": "4615860159156968589",
+    "port": 141,
+    "type": "EXTERNAL",
+    "panelMode": "0x31",
+    "currentModeId": 2193,
+    "dpi": 25.4,
+    "density": 0,
+    "supportedRefreshRates": [
+      60.0,
+      30.0,
+      20.0
+    ],
+    "appVsyncOffsetNanos": 6233334,
+    "presentationDeadlineNanos": 11500000,
+    "flags": [
+      "FLAG_ALLOWED_TO_BE_DEFAULT_DISPLAY",
+      "FLAG_PRESENTATION",
+      "FLAG_TRUSTED"
+    ],
+    "displayGroupId": 1,
+    "powerGroupId": 1,
+    "supportedModes": [
+      {
+        "id": 2193,
+        "width": 1920,
+        "height": 1080,
+        "fps": 60.0
+      },
+      {
+        "id": 2194,
+        "width": 1920,
+        "height": 1080,
+        "fps": 59.9402
+      },
+      {
+        "id": 2195,
+        "width": 640,
+        "height": 480,
+        "fps": 59.940475
+      },
+      {
+        "id": 2196,
+        "width": 768,
+        "height": 480,
+        "fps": 59.940475
+      }
+    ],
+    "displayPort": {
+      "numLanes": 4,
+      "linkTrainingStatus": "success",
+      "cable": "enabled",
+      "hotPlugDetect": true
+    },
+    "ratedByManufacturer": {
+      "comment": "From VITURE's own product page, not from the device.",
+      "twoDimensional": {
+        "width": 1920,
+        "height": 1080,
+        "maxHz": 120
+      },
+      "sideBySide": {
+        "width": 3840,
+        "height": 1080,
+        "maxHz": 60
+      },
+      "panel": "Sony micro-OLED",
+      "fieldOfViewDegrees": 50
+    }
+  },
+  "library": {
+    "comment": [
+      "Reading a media library, measured in both power states so the difference",
+      "between them is a fact rather than a suspicion.",
+      "",
+      "The suspicion was reasonable: this phone has four slow cores and three",
+      "middling ones, the battery saver exists, and a measurement taken at 8%",
+      "battery is a measurement of a phone trying to survive. So it was taken",
+      "again on the charger with the saver off \u2014 and the answer barely moved.",
+      "Per entry: 56 ns on battery, 59 ns on mains. Starting eight threads: 3.7 ms",
+      "on battery, 4.2 ms on mains. The threaded path loses at every size in both.",
+      "",
+      "So the cost of a thread here is the platform's, not the power mode's, and",
+      "the little cores are how the chip is built rather than something being",
+      "switched off to save power. Worth knowing, because it means the answer is",
+      "stable \u2014 and worth having measured, because it was not obvious.",
+      "",
+      "The calibration still re-runs when the power state changes. Not because",
+      "this reading demanded it, but because the reading is of one phone and the",
+      "code will meet others."
+    ],
+    "batterySaverOn": {
+      "batteryPercent": 8,
+      "charging": false,
+      "nanosPerEntry": {
+        "1024": 56.1,
+        "16384": 60.4,
+        "65536": 63.5
+      },
+      "nanosPerEntryWithoutSignatureFilter": 294.3,
+      "millisPerFiveHundredEntryFolder": 0.23,
+      "threadStartAndJoinMillis": {
+        "2": 0.86,
+        "4": 1.7,
+        "8": 3.75
+      },
+      "threadedVersusSerial": {
+        "4096": 0.06,
+        "16384": 0.34,
+        "65536": 0.53,
+        "262144": 0.65
+      },
+      "calibrationVerdict": "no crossover at any size"
+    },
+    "batterySaverOff": {
+      "batteryPercent": 11,
+      "charging": true,
+      "nanosPerEntry": {
+        "4096": 58.6,
+        "16384": 60.6,
+        "65536": 63.3
+      },
+      "millisPerFiveHundredEntryFolder": 0.286,
+      "threadStartAndJoinMillis": {
+        "2": 1.195,
+        "4": 2.163,
+        "8": 4.163
+      },
+      "threadedVersusSerial": {
+        "4096": 0.14,
+        "16384": 0.32,
+        "65536": 0.43,
+        "262144": 0.52
+      },
+      "calibrationVerdict": "no crossover at any size"
+    }
+  }
+}

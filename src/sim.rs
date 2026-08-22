@@ -15,8 +15,31 @@
 //! a desk. What is *not* simulated is USB itself: no lost packets, no partial
 //! reads, no EBUSY. Those belong to the transports, and each has its own.
 //!
-//! Available in test builds and behind the `sim` feature, so the harness can
-//! also be driven from an example or a benchmark.
+//! Available in test builds and behind the `sim` feature, and the Android
+//! driver is built with that feature on — so the glasses can be unplugged and
+//! the whole stack above them still runs. See [`xr_open_simulated`].
+//!
+//! # Faithful to what, exactly
+//!
+//! To the device as measured, not as imagined. `fixtures/measured_device.json`
+//! records what the hardware was seen doing — the pose rate counted rather than
+//! claimed, the display modes it actually advertises in each panel mode, the
+//! power state all of it was measured in — and the constants below are taken
+//! from it. Where the two disagree the fixture is right and this is a bug.
+//!
+//! The parts that matter and are easy to get wrong:
+//!
+//! * **The pose rate is 118.9 Hz, not 120.** Close enough to be mistaken for it
+//!   and far enough to matter: prediction divides by the interval between
+//!   samples, and a simulation that ran at exactly 120 would hide a rounding
+//!   error worth about a millisecond of lead.
+//! * **The panel advertises different modes depending on the mode it is in.**
+//!   There is no 3840-wide mode on offer until it has been switched to
+//!   side-by-side and has re-advertised. Anything that picks a mode has to look
+//!   again afterwards, and a simulation that offered every mode at once would
+//!   let that bug through.
+//! * **The panel goes dark when nobody is wearing it.** Which reads, from the
+//!   host, exactly like a display that has failed.
 
 use crate::{build, msg, Error, Rate, Result, Streams, Transport, FRAME_MAX, RESPONSE_OFFSET};
 
@@ -77,6 +100,96 @@ impl Trajectory for TurnThenStop {
     }
 }
 
+/// What the hardware was measured doing, so the simulation can be held to it.
+///
+/// Taken from `fixtures/measured_device.json`. Constants rather than a parsed
+/// file because the driver has no filesystem on the device it ships to, and a
+/// value that has drifted from the fixture is caught by a test that reads both.
+pub mod measured {
+    /// Poses per second, counted: 592 of them in 4.981 seconds.
+    ///
+    /// Not 120. The device is configured for 120 and delivers 118.9, and code
+    /// that assumes the nominal figure is out by one percent — which is nothing
+    /// until it is multiplied by a lookahead.
+    pub const POSE_RATE_HZ: f32 = 118.9;
+
+    /// USB identity of a Pro 2.
+    pub const USB_VENDOR_ID: u16 = 0x35CA;
+    pub const USB_PRODUCT_ID: u16 = 0x1301;
+
+    /// What the panel comes up in: one 1920x1080 picture, both eyes the same.
+    pub const MODE_2D: u8 = 0x31;
+    /// Side-by-side: one 3840x1080 frame, split between the eyes.
+    pub const MODE_SIDE_BY_SIDE: u8 = 0x32;
+
+    /// A display mode as the host sees it.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Mode {
+        pub width: u32,
+        pub height: u32,
+        pub fps: f32,
+    }
+
+    /// What the panel advertises in 2D.
+    ///
+    /// Note what is missing: anything above 60 Hz. The glasses are rated for
+    /// 1920x1080 at up to 120 Hz and DisplayPort is negotiated on all four
+    /// lanes with link training successful, so neither the panel nor the cable
+    /// is the limit — and it still offers 60, 30 and 20. Switching the panel
+    /// through its undocumented mode bytes 0x41 to 0x43 makes it re-advertise
+    /// with fresh mode ids and the same four modes, so that is not the way in
+    /// either. Unresolved, and recorded here rather than rounded off.
+    pub const MODES_2D: [Mode; 4] = [
+        Mode {
+            width: 1920,
+            height: 1080,
+            fps: 60.0,
+        },
+        Mode {
+            width: 1920,
+            height: 1080,
+            fps: 59.9402,
+        },
+        Mode {
+            width: 640,
+            height: 480,
+            fps: 59.940475,
+        },
+        Mode {
+            width: 768,
+            height: 480,
+            fps: 59.940475,
+        },
+    ];
+
+    /// What it advertises once switched to side-by-side.
+    ///
+    /// The 3840-wide mode exists only here. In 2D it is absent from the list
+    /// entirely, which is why a mode chosen once at startup is chosen from the
+    /// wrong list.
+    pub const MODES_SIDE_BY_SIDE: [Mode; 2] = [
+        Mode {
+            width: 3840,
+            height: 1080,
+            fps: 60.0,
+        },
+        Mode {
+            width: 1920,
+            height: 1080,
+            fps: 60.0,
+        },
+    ];
+
+    /// The modes the panel offers while it is in `mode`.
+    pub fn modes_for(mode: u8) -> &'static [Mode] {
+        if mode == MODE_SIDE_BY_SIDE {
+            &MODES_SIDE_BY_SIDE
+        } else {
+            &MODES_2D
+        }
+    }
+}
+
 /// The device's own state, as the driver can observe it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceState {
@@ -93,8 +206,7 @@ impl Default for DeviceState {
         DeviceState {
             streams: Streams::OFF,
             rate: Rate::Hz120,
-            // 1920x1080 at 60 Hz, which is what a Pro 2 comes up in.
-            display_mode: 0x31,
+            display_mode: measured::MODE_2D,
             brightness: 5,
             volume: 60,
             worn: true,
