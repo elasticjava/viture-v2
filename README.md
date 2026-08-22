@@ -91,6 +91,30 @@ camera inside the sphere would add parallax against geometry that is not there.
 [`glam`](https://github.com/bitshifter/glam-rs) supplies the matrix and quaternion
 routines. The default build stays dependency-free, and CI enforces that.
 
+## The simulated device
+
+`src/sim.rs`, behind the `sim` feature and always on in tests, is a `Transport`
+that answers like the glasses do: it builds real frames with the real builder,
+so the driver parses them with the real parser, and it plays a scripted head
+movement whose ground truth is known exactly.
+
+That makes the parts nobody can check by wearing the glasses checkable —
+prediction leading by the amount asked for, a still head predicted to be still,
+recentring cancelling heading without touching pitch, the reader surviving a
+command sent mid-stream. It runs in fractions of a second.
+
+`tests/simulated_view.rs` goes further and simulates the optics rather than the
+sensor: for a head orientation, a projection and a frame packing, it works out
+which part of the video lands where on the panel. Every rendering mistake this
+project has made passed every other automated check and was caught by putting
+the glasses on — a sphere textured upside down, a panorama letterboxed inside a
+smaller band, and the left and right eyes swapped. Each is a statement about
+which texel appears where, and each is now a test. The swapped eyes were found
+that way, having survived review.
+
+What is deliberately *not* simulated is USB: no lost packets, no partial reads,
+no `EBUSY`. Those belong to the transports.
+
 ## Measurements
 
 Pro 2 XR, raw stream at 1000 Hz requested (~770–795 Hz delivered over a USB/IP link):

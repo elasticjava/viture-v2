@@ -122,12 +122,17 @@ const RATE_SMOOTHING: f32 = 0.33;
 /// Body-frame angular velocity, in radians per second, between two orientations
 /// `dt` apart.
 ///
+/// Public because it is the whole basis of prediction on this device — the raw
+/// stream that would report rate directly cannot run alongside poses — and
+/// because a caller integrating this stack wants to check it against a known
+/// movement.
+///
 /// The rotation from one to the other is `conj(a) * b`; for a small rotation its
 /// vector part is half the axis-angle, so the rate is twice that over `dt`. The
 /// sign is normalised to the shorter arc, since `q` and `-q` are the same
 /// orientation and the difference between them is half a turn.
 #[inline]
-fn angular_rate(a: [f32; 4], b: [f32; 4], dt: f32) -> [f32; 3] {
+pub fn angular_rate(a: [f32; 4], b: [f32; 4], dt: f32) -> [f32; 3] {
     let [aw, ax, ay, az] = a;
     let [bw, bx, by, bz] = b;
     let mut d = [
@@ -190,8 +195,19 @@ impl Tracker {
     /// raw carries the angular rate that the prediction needs. The wire format
     /// allows both because the stream field is a bitmask.
     pub fn open(fd: i32, rate: Rate) -> crate::Result<Tracker> {
-        let mut dev = Device::new(Usbfs::new(fd, 0)?);
+        Tracker::with_transport(Device::new(Usbfs::new(fd, 0)?), rate)
+    }
 
+    /// The same, over any transport.
+    ///
+    /// Everything above the wire — the reader loop, recentring, rate estimation,
+    /// prediction — is the part that can be wrong in ways nobody notices until
+    /// the glasses are on. Taking the transport as an argument is what lets it
+    /// be driven from a scripted head movement instead. See [`crate::sim`].
+    pub fn with_transport<T>(mut dev: Device<T>, rate: Rate) -> crate::Result<Tracker>
+    where
+        T: Transport + Send + 'static,
+    {
         // Read the static facts while nothing else is using the command path.
         let mut buf = [0u8; 64];
         let info = DeviceInfo {

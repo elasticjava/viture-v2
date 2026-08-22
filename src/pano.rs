@@ -289,7 +289,14 @@ pub fn uv_window(layout: StereoLayout, eye: Eye) -> [f32; 4] {
     let second = eye == Eye::Right;
     match layout {
         StereoLayout::Mono => [1.0, 0.0, 1.0, 0.0],
-        StereoLayout::OverUnder => [1.0, 0.0, 0.5, if second { 0.5 } else { 0.0 }],
+        // The left eye takes the top half of the *image*, and texture space runs
+        // bottom to top — so the top half is the upper half of v, and the left
+        // eye gets the offset. Getting this backwards does not look broken; it
+        // looks like 3D that is subtly unpleasant to watch, which is why it is
+        // pinned by a test rather than left to reasoning.
+        StereoLayout::OverUnder => [1.0, 0.0, 0.5, if second { 0.0 } else { 0.5 }],
+        // Horizontal is unaffected by that flip: the left eye is still the left
+        // half of the frame.
         StereoLayout::SideBySide => [0.5, if second { 0.5 } else { 0.0 }, 1.0, 0.0],
     }
 }
@@ -746,9 +753,11 @@ mod tests {
             [1.0, 0.0, 1.0, 0.0]
         );
 
+        // The left eye reads the top half of the image, which in bottom-up
+        // texture space is the upper half of v.
         let [_, _, vs, vl] = uv_window(StereoLayout::OverUnder, Eye::Left);
         let [_, _, _, vr] = uv_window(StereoLayout::OverUnder, Eye::Right);
-        assert_eq!((vs, vl, vr), (0.5, 0.0, 0.5));
+        assert_eq!((vs, vl, vr), (0.5, 0.5, 0.0));
 
         let [us, ul, _, _] = uv_window(StereoLayout::SideBySide, Eye::Left);
         let [_, ur, _, _] = uv_window(StereoLayout::SideBySide, Eye::Right);

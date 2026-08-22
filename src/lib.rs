@@ -26,6 +26,9 @@ pub mod mesh;
 pub mod pano;
 pub mod pointer;
 pub mod ring;
+/// A simulated device, for exercising the whole stack without hardware.
+#[cfg(any(test, feature = "sim"))]
+pub mod sim;
 pub mod sys;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod uring;
@@ -109,6 +112,20 @@ pub enum Rate {
     Hz240 = 3,
     Hz500 = 4,
     Hz1000 = 5,
+}
+
+impl Rate {
+    /// Samples per second, which the wire encodes as an index.
+    pub const fn hz(self) -> u32 {
+        match self {
+            Rate::Hz60 => 60,
+            Rate::Hz90 => 90,
+            Rate::Hz120 => 120,
+            Rate::Hz240 => 240,
+            Rate::Hz500 => 500,
+            Rate::Hz1000 => 1000,
+        }
+    }
 }
 
 /// Display modes from the SDK header, confirmed through `0x3141`.
@@ -339,6 +356,11 @@ pub struct Device<T: Transport> {
 }
 
 impl<T: Transport> Device<T> {
+    /// The transport underneath, for inspecting what a test double recorded.
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
     pub fn new(transport: T) -> Self {
         Device {
             transport,
@@ -347,6 +369,8 @@ impl<T: Transport> Device<T> {
         }
     }
 
+    /// Mutable access to the transport — for a double that is scripted while
+    /// the device is running.
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
     }

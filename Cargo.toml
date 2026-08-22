@@ -13,6 +13,9 @@ default = []
 # Panorama-Geometrie und Kameramathematik fuer den 360-Grad-Renderer.
 # Optional, damit CLI und Treiber-Hot-Path abhaengigkeitsfrei bleiben.
 render = ["glam", "miniz_oxide"]
+# The simulated device. On in tests regardless; the feature exposes it to
+# examples and benchmarks too.
+sim = []
 
 [dependencies]
 # Im Hot Path des Treibers bewusst keine. Die Render-Mathematik dagegen steht
