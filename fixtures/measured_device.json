@@ -120,7 +120,17 @@
       "already known to do: the 3840-wide modes are absent until it is switched",
       "into 0x32 and re-advertises. The mode byte has unexplored neighbours \u2014",
       "0x41 to 0x45 \u2014 and the obvious hypothesis is that one of them is the",
-      "high-refresh mode. Untested: it needs the glasses attached."
+      "",
+      "A correction worth keeping, because the mistake is easy to repeat. A run",
+      "on 2026-08-22 appeared to show the panel offering 120 Hz and the open",
+      "question answered. It was the phone's display: the measurement grepped the",
+      "first supportedRefreshRates in a dump that lists display 0 first, and the",
+      "Pixel 9 does run at 120. Scoped to the VITURE section, the glasses offer",
+      "59.94 and 29.97 in side-by-side, and 60/30/20 in 2D.",
+      "",
+      "So 120 Hz remains unreached: rated for it, four DisplayPort lanes with",
+      "training successful, and not on offer. The mode bytes 0x41 to 0x43 make the",
+      "panel re-advertise with fresh ids and the same modes."
     ],
     "name": "VITURE",
     "manufacturerPnpId": "CVT",

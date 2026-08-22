@@ -159,7 +159,21 @@ if wanted 2; then
             tr ',' '\n' | grep -A0 -E 'width=|height=|fps=|supportedRefreshRates' |
             tr '\n' ' '
     }
-    "$adb" shell dumpsys display > "$out/display-2d.txt" 2>/dev/null || true
+    # Only the glasses' own section. Grepping the whole dump takes the first
+    # display, which is the phone — and the phone runs at 120 Hz, so the run
+    # reported that the glasses did too. They do not, and a measurement that
+    # answers an open question with the wrong display's number is worse than no
+    # measurement at all.
+    viture_section() {
+        python3 - "$1" <<'PYEOF'
+import sys
+text = open(sys.argv[1], errors="ignore").read()
+start = text.find('DisplayDeviceInfo{"VITURE"')
+print(text[start:start + 3000] if start >= 0 else "")
+PYEOF
+    }
+    "$adb" shell dumpsys display > "$out/display-2d-full.txt" 2>/dev/null || true
+    viture_section "$out/display-2d-full.txt" > "$out/display-2d.txt"
     rates=$(grep -o 'supportedRefreshRates \[[^]]*\]' "$out/display-2d.txt" | head -1 || echo '?')
     widest=$(grep -o 'width=[0-9]*' "$out/display-2d.txt" | cut -d= -f2 | sort -n | tail -1 || echo '?')
     report 2 "2D: refresh rates" "${rates#supportedRefreshRates }" "[60.0, 30.0, 20.0]" ""
@@ -167,12 +181,14 @@ if wanted 2; then
 
     "$adb" shell am start -n $ACTIVITY --ei com.uxspace.extra.DISPLAY_MODE 50 >/dev/null 2>&1 || true
     sleep 8
-    "$adb" shell dumpsys display > "$out/display-sbs.txt" 2>/dev/null || true
+    "$adb" shell dumpsys display > "$out/display-sbs-full.txt" 2>/dev/null || true
+    viture_section "$out/display-sbs-full.txt" > "$out/display-sbs.txt"
     widest_sbs=$(grep -o 'width=[0-9]*' "$out/display-sbs.txt" | cut -d= -f2 | sort -n | tail -1 || echo '?')
     rates_sbs=$(grep -o 'supportedRefreshRates \[[^]]*\]' "$out/display-sbs.txt" | head -1 || echo '?')
     report "" "side-by-side: widest" "$widest_sbs" "3840" ""
     report "" "side-by-side: rates" "${rates_sbs#supportedRefreshRates }" "[60.0, ...]" ""
-    note "if anything above 60 appears here, the 120 Hz question is answered"
+     note "above 60 here answers the 120 Hz question — and it must be the glasses'"'"' own"
+    note "section, not the phone'"'"'s, which does run at 120"
 
     lanes=$("$adb" shell dumpsys usb 2>/dev/null | grep -o 'numLanes=[0-9]*' | head -1 || echo '?')
     train=$("$adb" shell dumpsys usb 2>/dev/null | grep -o 'linkTrainingStatus=[a-z]*' | head -1 || echo '?')
