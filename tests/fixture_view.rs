@@ -14,8 +14,9 @@
 use std::path::PathBuf;
 
 use viture_v2::pano::{
-    sphere_mesh, uv_window, vertex_count, view_projection, Eye, Projection, StereoLayout,
-    VERTEX_FLOATS,
+    index_count, screen_mesh, screen_vertex_count, sphere_indices, sphere_mesh, uv_window,
+    vertex_count, view_projection, Eye, Projection, StereoLayout, DEFAULT_SCREEN_DISTANCE,
+    DEFAULT_SCREEN_WIDTH_DEG, VERTEX_FLOATS,
 };
 
 const RINGS: u32 = 64;
@@ -30,35 +31,92 @@ fn fixture() -> serde_json::Value {
     serde_json::from_str(&text).expect("the fixture should be valid JSON")
 }
 
-/// What the middle of the panel samples for one eye, looking straight ahead.
+/// What the middle of the panel samples for one eye.
 ///
-/// Built from the mesh the renderer uploads and the matrix it draws with, so
-/// this is the whole chain rather than a restatement of `uv_window`.
+/// Built from the mesh the renderer uploads and the matrix it draws with, and
+/// interpolated across the triangle the point falls in rather than snapped to
+/// the nearest vertex — a screen has two rows, so its nearest vertex is always
+/// an edge and never the middle of the picture.
 fn centre_uv(projection: Projection, layout: StereoLayout, eye: Eye) -> [f32; 2] {
-    let mut mesh = vec![0.0f32; vertex_count(RINGS, SECTORS) * VERTEX_FLOATS];
-    sphere_mesh(RINGS, SECTORS, 1.0, projection, &mut mesh).expect("mesh");
+    // The eye offset is left at zero even for a screen: what is being isolated
+    // here is the stereo window, and a displaced camera would move the sampled
+    // point for a reason that has nothing to do with it.
+    let (mesh, triangles) = surface(projection);
 
     let mut mvp = [0.0f32; 16];
     view_projection([1.0, 0.0, 0.0, 0.0], 25.8, 16.0 / 9.0, &mut mvp);
 
-    // The vertex nearest the middle of the panel.
-    let mut best = ([0.0f32, 0.0], f32::MAX);
-    for v in mesh.as_chunks::<VERTEX_FLOATS>().0 {
+    let project = |index: usize| -> Option<([f32; 2], [f32; 2])> {
+        let v = &mesh[index * VERTEX_FLOATS..][..VERTEX_FLOATS];
         let mut clip = [0.0f32; 4];
         for (row, out) in clip.iter_mut().enumerate() {
             *out = mvp[row] * v[0] + mvp[4 + row] * v[1] + mvp[8 + row] * v[2] + mvp[12 + row];
         }
-        if clip[3] <= 1e-6 {
-            continue;
-        }
-        let distance = (clip[0] / clip[3]).powi(2) + (clip[1] / clip[3]).powi(2);
-        if distance < best.1 {
-            best = ([v[3], v[4]], distance);
-        }
-    }
+        (clip[3] > 1e-6).then(|| ([clip[0] / clip[3], clip[1] / clip[3]], [v[3], v[4]]))
+    };
+
+    let uv = triangles
+        .iter()
+        .find_map(|&[i, j, k]| {
+            let (a, ua) = project(i)?;
+            let (b, ub) = project(j)?;
+            let (c, uc) = project(k)?;
+            barycentric([0.0, 0.0], a, b, c).map(|[wa, wb, wc]| {
+                [
+                    ua[0] * wa + ub[0] * wb + uc[0] * wc,
+                    ua[1] * wa + ub[1] * wb + uc[1] * wc,
+                ]
+            })
+        })
+        .expect("something should cover the middle of the panel");
 
     let [us, uo, vs, vo] = uv_window(layout, eye);
-    [best.0[0] * us + uo, best.0[1] * vs + vo]
+    [uv[0] * us + uo, uv[1] * vs + vo]
+}
+
+/// The mesh the renderer would upload for a projection, and its triangles.
+fn surface(projection: Projection) -> (Vec<f32>, Vec<[usize; 3]>) {
+    if projection.is_panoramic() {
+        let mut mesh = vec![0.0f32; vertex_count(RINGS, SECTORS) * VERTEX_FLOATS];
+        sphere_mesh(RINGS, SECTORS, 1.0, projection, &mut mesh).expect("sphere");
+        let mut indices = vec![0u16; index_count(RINGS, SECTORS)];
+        sphere_indices(RINGS, SECTORS, &mut indices).expect("indices");
+        let triangles = indices
+            .chunks_exact(3)
+            .map(|t| [t[0] as usize, t[1] as usize, t[2] as usize])
+            .collect();
+        (mesh, triangles)
+    } else {
+        let segments = 64;
+        let mut mesh = vec![0.0f32; screen_vertex_count(segments) * VERTEX_FLOATS];
+        screen_mesh(
+            segments,
+            DEFAULT_SCREEN_DISTANCE,
+            DEFAULT_SCREEN_WIDTH_DEG,
+            16.0 / 9.0,
+            0.0,
+            &mut mesh,
+        )
+        .expect("screen");
+        // A triangle strip: every three consecutive vertices form a triangle.
+        let count = screen_vertex_count(segments);
+        let triangles = (0..count - 2).map(|i| [i, i + 1, i + 2]).collect();
+        (mesh, triangles)
+    }
+}
+
+/// Barycentric weights of `p` in the triangle `a b c`, or `None` if it is
+/// outside. Winding-agnostic, since a strip alternates.
+fn barycentric(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> Option<[f32; 3]> {
+    let area = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
+    if area.abs() < 1e-9 {
+        return None;
+    }
+    let wa = ((b[0] - p[0]) * (c[1] - p[1]) - (c[0] - p[0]) * (b[1] - p[1])) / area;
+    let wb = ((c[0] - p[0]) * (a[1] - p[1]) - (a[0] - p[0]) * (c[1] - p[1])) / area;
+    let wc = 1.0 - wa - wb;
+    let inside = [wa, wb, wc].iter().all(|w| *w >= -1e-5);
+    inside.then_some([wa, wb, wc])
 }
 
 fn layout_of(packing: u64) -> StereoLayout {
@@ -92,10 +150,10 @@ fn every_scenario_puts_the_right_half_of_the_frame_in_front_of_each_eye() {
                 expected[1].as_f64().unwrap() as f32,
             ];
             let got = centre_uv(projection, layout, eye);
-            // A tenth of a mesh cell. The centre of an equirectangular image is
-            // straight ahead exactly, but the nearest vertex to the middle of
-            // the panel is on a grid.
-            let tolerance = 0.1 / SECTORS as f32;
+            // Interpolated across the triangle, so this is exact up to the
+            // mesh's own faceting: a sphere approximated by flat quads is a
+            // fraction of a cell away from the ideal surface.
+            let tolerance = 1e-3;
             assert!(
                 (got[0] - want[0]).abs() < tolerance && (got[1] - want[1]).abs() < tolerance,
                 "{name}, {key} eye: sampled {got:?}, expected {want:?}",
@@ -173,7 +231,7 @@ fn the_fixture_covers_both_projections_and_all_three_packings() {
     );
     assert_eq!(
         projections,
-        [0, 1].into_iter().collect(),
+        [0, 1, 2].into_iter().collect(),
         "projections covered"
     );
 }

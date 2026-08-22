@@ -10,7 +10,7 @@
     "side's test fails, which is the point.",
     "",
     "packing:    0 monoscopic, 1 over-under, 2 side-by-side",
-    "projection: 0 full sphere, 1 VR180 front hemisphere",
+    "projection: 0 full sphere, 1 VR180 front hemisphere, 2 a flat screen",
     "verdict:    GUESSED weakest, then CATALOGUED, DECLARED, CHOSEN",
     "centreUv:   what the middle of the panel samples, per eye, looking straight",
     "            ahead. Exact, because the middle of an equirectangular image is",
@@ -26,8 +26,21 @@
         "height": 1920,
         "stereomode": "mono"
       },
-      "expect": { "packing": 0, "projection": 0, "verdict": "CATALOGUED" },
-      "centreUv": { "left": [0.5, 0.5], "right": [0.5, 0.5] }
+      "expect": {
+        "packing": 0,
+        "projection": 0,
+        "verdict": "CATALOGUED"
+      },
+      "centreUv": {
+        "left": [
+          0.5,
+          0.5
+        ],
+        "right": [
+          0.5,
+          0.5
+        ]
+      }
     },
     {
       "name": "an over-under sphere the catalogue scanned",
@@ -37,8 +50,21 @@
         "height": 3840,
         "stereomode": "top_bottom"
       },
-      "expect": { "packing": 1, "projection": 0, "verdict": "CATALOGUED" },
-      "centreUv": { "left": [0.5, 0.75], "right": [0.5, 0.25] }
+      "expect": {
+        "packing": 1,
+        "projection": 0,
+        "verdict": "CATALOGUED"
+      },
+      "centreUv": {
+        "left": [
+          0.5,
+          0.75
+        ],
+        "right": [
+          0.5,
+          0.25
+        ]
+      }
     },
     {
       "name": "a side-by-side VR180 recording",
@@ -48,8 +74,21 @@
         "height": 3840,
         "stereomode": "left_right"
       },
-      "expect": { "packing": 2, "projection": 1, "verdict": "CATALOGUED" },
-      "centreUv": { "left": [0.25, 0.5], "right": [0.75, 0.5] }
+      "expect": {
+        "packing": 2,
+        "projection": 1,
+        "verdict": "CATALOGUED"
+      },
+      "centreUv": {
+        "left": [
+          0.25,
+          0.5
+        ],
+        "right": [
+          0.75,
+          0.5
+        ]
+      }
     },
     {
       "name": "an over-under VR180 recording",
@@ -59,8 +98,21 @@
         "height": 7680,
         "stereomode": "top_bottom"
       },
-      "expect": { "packing": 1, "projection": 1, "verdict": "CATALOGUED" },
-      "centreUv": { "left": [0.5, 0.75], "right": [0.5, 0.25] }
+      "expect": {
+        "packing": 1,
+        "projection": 1,
+        "verdict": "CATALOGUED"
+      },
+      "centreUv": {
+        "left": [
+          0.5,
+          0.75
+        ],
+        "right": [
+          0.5,
+          0.25
+        ]
+      }
     },
     {
       "name": "an unscanned file whose name states the packing",
@@ -70,8 +122,21 @@
         "height": 0,
         "stereomode": null
       },
-      "expect": { "packing": 1, "projection": 0, "verdict": "GUESSED" },
-      "centreUv": { "left": [0.5, 0.75], "right": [0.5, 0.25] }
+      "expect": {
+        "packing": 1,
+        "projection": 2,
+        "verdict": "GUESSED"
+      },
+      "centreUv": {
+        "left": [
+          0.5,
+          0.75
+        ],
+        "right": [
+          0.5,
+          0.25
+        ]
+      }
     },
     {
       "name": "an empty stereo mode does not outrank a marked name",
@@ -81,8 +146,21 @@
         "height": 1920,
         "stereomode": ""
       },
-      "expect": { "packing": 1, "projection": 0, "verdict": "GUESSED" },
-      "centreUv": { "left": [0.5, 0.75], "right": [0.5, 0.25] }
+      "expect": {
+        "packing": 1,
+        "projection": 2,
+        "verdict": "GUESSED"
+      },
+      "centreUv": {
+        "left": [
+          0.5,
+          0.75
+        ],
+        "right": [
+          0.5,
+          0.25
+        ]
+      }
     },
     {
       "name": "a stereo mode nothing can split falls back to inference",
@@ -92,8 +170,21 @@
         "height": 1920,
         "stereomode": "anaglyph_cyan_red"
       },
-      "expect": { "packing": 0, "projection": 0, "verdict": "GUESSED" },
-      "centreUv": { "left": [0.5, 0.5], "right": [0.5, 0.5] }
+      "expect": {
+        "packing": 0,
+        "projection": 0,
+        "verdict": "GUESSED"
+      },
+      "centreUv": {
+        "left": [
+          0.5,
+          0.5
+        ],
+        "right": [
+          0.5,
+          0.5
+        ]
+      }
     },
     {
       "name": "a VR180 file named as such but never scanned",
@@ -103,8 +194,117 @@
         "height": 0,
         "stereomode": null
       },
-      "expect": { "packing": 2, "projection": 1, "verdict": "GUESSED" },
-      "centreUv": { "left": [0.25, 0.5], "right": [0.75, 0.5] }
+      "expect": {
+        "packing": 2,
+        "projection": 1,
+        "verdict": "GUESSED"
+      },
+      "centreUv": {
+        "left": [
+          0.25,
+          0.5
+        ],
+        "right": [
+          0.75,
+          0.5
+        ]
+      }
+    },
+    {
+      "name": "an ordinary film is a screen, not a sphere",
+      "kodi": {
+        "label": "Arrival (2016)",
+        "width": 1920,
+        "height": 1080,
+        "stereomode": "mono"
+      },
+      "expect": {
+        "packing": 0,
+        "projection": 2,
+        "verdict": "CATALOGUED"
+      },
+      "centreUv": {
+        "left": [
+          0.5,
+          0.5
+        ],
+        "right": [
+          0.5,
+          0.5
+        ]
+      }
+    },
+    {
+      "name": "a scope film is still a screen, despite being wide",
+      "kodi": {
+        "label": "Dune",
+        "width": 3840,
+        "height": 1608,
+        "stereomode": "mono"
+      },
+      "expect": {
+        "packing": 0,
+        "projection": 2,
+        "verdict": "CATALOGUED"
+      },
+      "centreUv": {
+        "left": [
+          0.5,
+          0.5
+        ],
+        "right": [
+          0.5,
+          0.5
+        ]
+      }
+    },
+    {
+      "name": "a full side-by-side 3D film on a screen",
+      "kodi": {
+        "label": "Gravity 3D",
+        "width": 3840,
+        "height": 1080,
+        "stereomode": "left_right"
+      },
+      "expect": {
+        "packing": 2,
+        "projection": 2,
+        "verdict": "CATALOGUED"
+      },
+      "centreUv": {
+        "left": [
+          0.25,
+          0.5
+        ],
+        "right": [
+          0.75,
+          0.5
+        ]
+      }
+    },
+    {
+      "name": "a four-by-three film is not over-under 3D",
+      "kodi": {
+        "label": "Casablanca",
+        "width": 1440,
+        "height": 1080,
+        "stereomode": "mono"
+      },
+      "expect": {
+        "packing": 0,
+        "projection": 2,
+        "verdict": "CATALOGUED"
+      },
+      "centreUv": {
+        "left": [
+          0.5,
+          0.5
+        ],
+        "right": [
+          0.5,
+          0.5
+        ]
+      }
     }
   ]
 }

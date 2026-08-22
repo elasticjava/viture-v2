@@ -81,24 +81,56 @@ pub enum Projection {
     /// hemisphere is built, so turning round shows the background rather than
     /// the footage smeared across geometry it was never meant to cover.
     Equirect180 = 1,
+    /// Not a panorama at all: an ordinary rectangular picture, shown on a screen
+    /// standing in the room.
+    ///
+    /// This is what most video is, and playing it on a sphere smears one frame
+    /// across the whole world. It is here rather than as a special case
+    /// elsewhere because the choice between a sphere and a screen is exactly the
+    /// same decision as the choice between a full sphere and a hemisphere: how
+    /// much world does this image cover.
+    Flat = 2,
 }
 
 impl Projection {
     pub fn from_raw(v: u32) -> Projection {
         match v {
             1 => Projection::Equirect180,
+            2 => Projection::Flat,
             _ => Projection::Equirect360,
         }
     }
 
-    /// The longitude the image spans, in radians.
+    /// Whether this projection wraps around the viewer at all.
+    pub fn is_panoramic(self) -> bool {
+        self != Projection::Flat
+    }
+
+    /// The longitude the image spans, in radians. Meaningless for [`Flat`],
+    /// which is built by [`screen_mesh`] instead.
     fn arc(self) -> f32 {
         match self {
             Projection::Equirect360 => std::f32::consts::TAU,
-            Projection::Equirect180 => std::f32::consts::PI,
+            _ => std::f32::consts::PI,
         }
     }
 }
+
+/// Limits on how large a screen may be asked to appear, in degrees across.
+///
+/// The lower bound is a screen you would have to lean towards; the upper is
+/// wider than the optics can show, which is allowed because looking around a
+/// screen that overflows the view is a legitimate way to watch one.
+pub const MIN_SCREEN_WIDTH_DEG: f32 = 10.0;
+pub const MAX_SCREEN_WIDTH_DEG: f32 = 120.0;
+
+/// A comfortable default: about the angle a cinema screen subtends from the
+/// middle of the stalls.
+pub const DEFAULT_SCREEN_WIDTH_DEG: f32 = 45.0;
+
+/// Where the screen stands, in metres. Far enough that the eyes relax, near
+/// enough that it does not feel painted on the horizon.
+pub const DEFAULT_SCREEN_DISTANCE: f32 = 4.0;
 
 /// Which eye a frame is being drawn for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -339,11 +371,33 @@ pub fn zoom_for_fov(fov_deg: f32) -> f32 {
 /// the disparity already encoded in the footage would fight it. Both eyes get
 /// this matrix and differ only in [`uv_window`].
 pub fn view_projection(head: [f32; 4], fov_y_deg: f32, aspect: f32, out: &mut [f32; 16]) {
+    view_projection_for_eye(head, fov_y_deg, aspect, 0.0, out)
+}
+
+/// The same, with the camera displaced sideways by `eye_offset` metres.
+///
+/// Zero for a panorama, and that is not an oversight: a sphere is at a fixed
+/// radius with the same geometry for both eyes, so moving the camera inside it
+/// invents parallax against a wall that is not there, and fights the disparity
+/// already in the footage.
+///
+/// A screen is different. It stands at a real distance in the room, so each eye
+/// should see it from where that eye is — that is what makes it a screen rather
+/// than a picture painted on the sky. The depth *within* the picture still comes
+/// from the two half-images; this only places the screen itself.
+pub fn view_projection_for_eye(
+    head: [f32; 4],
+    fov_y_deg: f32,
+    aspect: f32,
+    eye_offset: f32,
+    out: &mut [f32; 16],
+) {
     let [w, x, y, z] = head;
     let q = Quat::from_xyzw(x, y, z, w).normalize();
     // World-to-view is the inverse of the head's world orientation. For a unit
     // quaternion that is the conjugate, which `inverse` reduces to.
-    let view = Mat4::from_quat(q.inverse());
+    let view = Mat4::from_translation(glam::Vec3::new(-eye_offset, 0.0, 0.0))
+        * Mat4::from_quat(q.inverse());
     let fov = fov_y_deg.clamp(MIN_FOV_DEG, MAX_FOV_DEG).to_radians();
     let aspect = if aspect.is_finite() && aspect > 0.0 {
         aspect
@@ -352,6 +406,91 @@ pub fn view_projection(head: [f32; 4], fov_y_deg: f32, aspect: f32, out: &mut [f
     };
     let proj = opengl::perspective(fov, aspect, NEAR, FAR);
     out.copy_from_slice(&(proj * view).to_cols_array());
+}
+
+/// Vertices [`screen_mesh`] will write for a given number of segments.
+///
+/// Two rows of `segments + 1` columns, wound as one triangle strip — a screen
+/// needs no index buffer and no tessellation vertically, because a cylinder is
+/// straight up and down.
+pub const fn screen_vertex_count(segments: u32) -> usize {
+    2 * (segments as usize + 1)
+}
+
+/// Writes a screen standing in the room, as an interleaved `[x, y, z, u, v]`
+/// triangle strip.
+///
+/// `width_deg` is how wide the screen should *appear* from where the viewer is,
+/// which is the thing a person actually has an opinion about — "make it bigger"
+/// means a wider angle, not a larger object at an unknown distance. `distance`
+/// then only decides how far away it feels; the two together give the physical
+/// size.
+///
+/// `aspect` is the picture's width over its height **after** the stereo split: a
+/// side-by-side film that is 3840×1080 on disc is 16:9 per eye, and passing the
+/// frame's own 32:9 would give a screen twice as wide as the picture on it.
+///
+/// `curvature` runs from 0 for a flat plane to 1 for an arc every part of which
+/// is the same distance away. Curving trades a little geometric honesty for
+/// edges that stay in focus, which is why cinema screens and monitors both do
+/// it; the arc radius is `distance / curvature`, so the two ends meet
+/// continuously.
+///
+/// Returns the vertex count, or `None` if the request or the buffer is unusable.
+pub fn screen_mesh(
+    segments: u32,
+    distance: f32,
+    width_deg: f32,
+    aspect: f32,
+    curvature: f32,
+    out: &mut [f32],
+) -> Option<usize> {
+    let count = screen_vertex_count(segments);
+    if segments == 0
+        || !distance.is_finite()
+        || distance <= 0.0
+        || !aspect.is_finite()
+        || aspect <= 0.0
+        || out.len() < count * VERTEX_FLOATS
+    {
+        return None;
+    }
+
+    let width = width_deg.clamp(MIN_SCREEN_WIDTH_DEG, MAX_SCREEN_WIDTH_DEG);
+    let half_width = distance * (width.to_radians() * 0.5).tan();
+    let half_height = half_width / aspect;
+    let curvature = curvature.clamp(0.0, 1.0);
+
+    let mut w = 0;
+    for i in 0..=segments {
+        let t = i as f32 / segments as f32;
+        // Arc length from the middle of the screen, so the picture is not
+        // stretched towards the edges as it curves.
+        let s = (t - 0.5) * 2.0 * half_width;
+        let (x, z) = if curvature < 1e-4 {
+            (s, -distance)
+        } else {
+            let radius = distance / curvature;
+            let angle = s / radius;
+            (
+                radius * angle.sin(),
+                -distance + radius * (1.0 - angle.cos()),
+            )
+        };
+
+        // Top of the column first, then the bottom: the strip's first triangle
+        // is then counter-clockwise from in front, and every following one
+        // inherits that.
+        for (y, v) in [(half_height, 1.0f32), (-half_height, 0.0f32)] {
+            out[w] = x;
+            out[w + 1] = y;
+            out[w + 2] = z;
+            out[w + 3] = t;
+            out[w + 4] = v;
+            w += VERTEX_FLOATS;
+        }
+    }
+    Some(count)
 }
 
 /// Where the viewer is looking, as a point in the equirectangular image.
@@ -464,7 +603,8 @@ pub unsafe extern "C" fn xr_pano_uv(layout: u32, eye: i32, out: *mut f32) -> i32
 /// top of it, and the shear tracks head speed, so it shows up precisely when it
 /// is most visible.
 ///
-/// Both eyes share the result — see [`view_projection`].
+/// `eye_offset` displaces the camera sideways, in metres. Zero for a panorama,
+/// where both eyes share the result — see [`view_projection_for_eye`] for why.
 ///
 /// # Safety
 /// `out` must point to sixteen writable, aligned `f32`s.
@@ -476,15 +616,46 @@ pub unsafe extern "C" fn xr_pano_mvp(
     z: f32,
     fov_y_deg: f32,
     aspect: f32,
+    eye_offset: f32,
     out: *mut f32,
 ) -> i32 {
     if out.is_null() {
         return -1;
     }
     let mut m = [0.0f32; 16];
-    view_projection([w, x, y, z], fov_y_deg, aspect, &mut m);
+    view_projection_for_eye([w, x, y, z], fov_y_deg, aspect, eye_offset, &mut m);
     std::ptr::copy_nonoverlapping(m.as_ptr(), out, 16);
     0
+}
+
+/// Vertices [`xr_screen_mesh`] will write, for sizing the buffer.
+#[no_mangle]
+pub extern "C" fn xr_screen_vertex_count(segments: u32) -> u32 {
+    screen_vertex_count(segments) as u32
+}
+
+/// Fills `out` with a screen standing in the room, as an interleaved
+/// `[x, y, z, u, v]` triangle strip. Returns the vertex count, or -1.
+///
+/// `aspect` is the picture's shape after the stereo split, not the frame's.
+///
+/// # Safety
+/// `out` must point to `cap_floats` writable, aligned `f32`s.
+#[no_mangle]
+pub unsafe extern "C" fn xr_screen_mesh(
+    segments: u32,
+    distance: f32,
+    width_deg: f32,
+    aspect: f32,
+    curvature: f32,
+    out: *mut f32,
+    cap_floats: usize,
+) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    let slice = std::slice::from_raw_parts_mut(out, cap_floats);
+    screen_mesh(segments, distance, width_deg, aspect, curvature, slice).map_or(-1, |n| n as i32)
 }
 
 /// Writes the `[u, v]` a head orientation is looking at.
@@ -703,6 +874,170 @@ mod tests {
                 assert!(facing <= 0.0, "outward-facing triangle ({facing})");
             }
         }
+    }
+
+    #[test]
+    fn a_flat_screen_stands_at_the_distance_asked_for() {
+        let mut verts = vec![0.0f32; screen_vertex_count(32) * VERTEX_FLOATS];
+        screen_mesh(32, 4.0, 45.0, 16.0 / 9.0, 0.0, &mut verts).unwrap();
+        for c in verts.as_chunks::<VERTEX_FLOATS>().0 {
+            assert!(
+                (c[2] + 4.0).abs() < 1e-4,
+                "a flat screen bent to z = {}",
+                c[2]
+            );
+        }
+    }
+
+    #[test]
+    fn a_fully_curved_screen_is_equidistant() {
+        // The reason to curve one at all: every part of it is then the same
+        // distance away, so none of it is out of focus.
+        let mut verts = vec![0.0f32; screen_vertex_count(64) * VERTEX_FLOATS];
+        screen_mesh(64, 4.0, 90.0, 16.0 / 9.0, 1.0, &mut verts).unwrap();
+        for c in verts.as_chunks::<VERTEX_FLOATS>().0 {
+            let horizontal = (c[0] * c[0] + c[2] * c[2]).sqrt();
+            assert!(
+                (horizontal - 4.0).abs() < 1e-3,
+                "a point {horizontal} m away on a screen that should be 4 m",
+            );
+        }
+    }
+
+    #[test]
+    fn a_screen_subtends_the_angle_it_was_asked_for() {
+        // Size is expressed as an angle because that is the thing a person has
+        // an opinion about; distance only decides how far away it feels.
+        for width in [20.0f32, 45.0, 90.0] {
+            let mut verts = vec![0.0f32; screen_vertex_count(8) * VERTEX_FLOATS];
+            screen_mesh(8, 4.0, width, 16.0 / 9.0, 0.0, &mut verts).unwrap();
+            let chunks = verts.as_chunks::<VERTEX_FLOATS>().0;
+            let right = chunks.last().unwrap();
+            let subtended = 2.0 * (right[0] / -right[2]).atan().to_degrees();
+            assert!(
+                (subtended - width).abs() < 0.01,
+                "asked for {width}°, got {subtended}°",
+            );
+        }
+    }
+
+    #[test]
+    fn a_screen_keeps_the_picture_s_shape() {
+        // Passing the frame's own aspect for a side-by-side film would give a
+        // screen twice as wide as the picture on it.
+        let mut verts = vec![0.0f32; screen_vertex_count(8) * VERTEX_FLOATS];
+        screen_mesh(8, 4.0, 45.0, 16.0 / 9.0, 0.0, &mut verts).unwrap();
+        let chunks = verts.as_chunks::<VERTEX_FLOATS>().0;
+        let half_width = chunks.last().unwrap()[0];
+        let half_height = chunks[0][1];
+        assert!(
+            ((half_width / half_height) - 16.0 / 9.0).abs() < 1e-3,
+            "the screen is {}:1 for a 16:9 picture",
+            half_width / half_height,
+        );
+    }
+
+    #[test]
+    fn the_screen_s_texture_runs_the_same_way_as_the_sphere_s() {
+        // Two conventions in one renderer is how a picture ends up upside down
+        // on one surface and not the other.
+        let mut verts = vec![0.0f32; screen_vertex_count(4) * VERTEX_FLOATS];
+        screen_mesh(4, 4.0, 45.0, 16.0 / 9.0, 0.0, &mut verts).unwrap();
+        let chunks = verts.as_chunks::<VERTEX_FLOATS>().0;
+        let top = chunks
+            .iter()
+            .max_by(|a, b| a[1].partial_cmp(&b[1]).unwrap())
+            .unwrap();
+        let bottom = chunks
+            .iter()
+            .min_by(|a, b| a[1].partial_cmp(&b[1]).unwrap())
+            .unwrap();
+        assert_eq!(top[4], 1.0, "the top of the screen should be v = 1");
+        assert_eq!(bottom[4], 0.0, "the bottom should be v = 0");
+        // And u grows to the right, as on the sphere.
+        let left = chunks
+            .iter()
+            .min_by(|a, b| a[0].partial_cmp(&b[0]).unwrap())
+            .unwrap();
+        assert_eq!(left[3], 0.0);
+    }
+
+    #[test]
+    fn the_screen_faces_the_viewer() {
+        // A triangle strip inherits the winding of its first triangle, so that
+        // one decides whether the screen is visible at all with culling on.
+        let mut verts = vec![0.0f32; screen_vertex_count(8) * VERTEX_FLOATS];
+        screen_mesh(8, 4.0, 45.0, 16.0 / 9.0, 0.0, &mut verts).unwrap();
+        let chunks = verts.as_chunks::<VERTEX_FLOATS>().0;
+        let p = |i: usize| [chunks[i][0], chunks[i][1], chunks[i][2]];
+        let (a, b, c) = (p(0), p(1), p(2));
+        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let n = [
+            ab[1] * ac[2] - ab[2] * ac[1],
+            ab[2] * ac[0] - ab[0] * ac[2],
+            ab[0] * ac[1] - ab[1] * ac[0],
+        ];
+        // The normal must point back towards the viewer at the origin.
+        let facing = n[0] * a[0] + n[1] * a[1] + n[2] * a[2];
+        assert!(facing < 0.0, "the screen faces away ({facing})");
+    }
+
+    #[test]
+    fn an_unusable_screen_request_is_refused() {
+        let mut verts = vec![0.0f32; screen_vertex_count(32) * VERTEX_FLOATS];
+        assert_eq!(
+            screen_mesh(0, 4.0, 45.0, 1.78, 0.0, &mut verts),
+            None,
+            "no segments"
+        );
+        assert_eq!(
+            screen_mesh(8, 0.0, 45.0, 1.78, 0.0, &mut verts),
+            None,
+            "at the eye"
+        );
+        assert_eq!(
+            screen_mesh(8, 4.0, 45.0, 0.0, 0.0, &mut verts),
+            None,
+            "no aspect"
+        );
+        let mut tiny = [0.0f32; 4];
+        assert_eq!(
+            screen_mesh(8, 4.0, 45.0, 1.78, 0.0, &mut tiny),
+            None,
+            "no room"
+        );
+    }
+
+    #[test]
+    fn an_eye_offset_moves_the_camera_and_nothing_else() {
+        // A screen at four metres should shift a little between the eyes; a
+        // panorama should not shift at all, which is why the offset is a
+        // parameter rather than always applied.
+        let point = [0.0f32, 0.0, -4.0];
+        let mut centred = [0.0f32; 16];
+        let mut right_eye = [0.0f32; 16];
+        view_projection([1.0, 0.0, 0.0, 0.0], DEFAULT_FOV_DEG, 1.78, &mut centred);
+        view_projection_for_eye(
+            [1.0, 0.0, 0.0, 0.0],
+            DEFAULT_FOV_DEG,
+            1.78,
+            0.0315,
+            &mut right_eye,
+        );
+
+        let x_of = |m: &[f32; 16]| {
+            let w = m[3] * point[0] + m[7] * point[1] + m[11] * point[2] + m[15];
+            (m[0] * point[0] + m[4] * point[1] + m[8] * point[2] + m[12]) / w
+        };
+        let shift = x_of(&right_eye) - x_of(&centred);
+        assert!(
+            shift < 0.0,
+            "the right eye should see the screen shifted left"
+        );
+        assert!(shift.abs() > 1e-4, "the eye offset did nothing");
+        // And view_projection itself is still the zero-offset case.
+        assert!((x_of(&centred)).abs() < 1e-6);
     }
 
     #[test]
