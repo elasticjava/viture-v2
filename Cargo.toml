@@ -26,6 +26,25 @@ glam = { version = "0.33", optional = true }
 # so cross-compiling stays a one-liner.
 miniz_oxide = { version = "0.9", optional = true }
 
+# Integration tests are compiled whatever the feature set, so the ones that
+# need a feature have to say so or a --no-default-features build fails on
+# imports that are not there.
+[[test]]
+name = "simulated_glasses"
+required-features = ["sim"]
+
+[[test]]
+name = "simulated_tracker"
+required-features = ["sim"]
+
+[[test]]
+name = "simulated_view"
+required-features = ["render"]
+
+[[test]]
+name = "fixture_view"
+required-features = ["render"]
+
 [dev-dependencies]
 # Reading the shared scenario fixture. A development dependency only: it is not
 # part of anything that ships, and the guard on the default build's dependency
