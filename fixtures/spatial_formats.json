@@ -1,0 +1,110 @@
+{
+  "comment": [
+    "Scenarios that cross the seam between the media library and the renderer.",
+    "",
+    "Each entry describes what a media centre reports about a file, what the",
+    "library should conclude from it, and what the wearer should then see. The",
+    "two ends are tested in different languages and different processes — the",
+    "Kotlin side asserts the first half, the Rust side the second — so this file",
+    "is what keeps them agreeing. Change one side's behaviour and the other",
+    "side's test fails, which is the point.",
+    "",
+    "packing:    0 monoscopic, 1 over-under, 2 side-by-side",
+    "projection: 0 full sphere, 1 VR180 front hemisphere",
+    "verdict:    GUESSED weakest, then CATALOGUED, DECLARED, CHOSEN",
+    "centreUv:   what the middle of the panel samples, per eye, looking straight",
+    "            ahead. Exact, because the middle of an equirectangular image is",
+    "            straight ahead by definition and the stereo window is a fixed",
+    "            transform on top."
+  ],
+  "scenarios": [
+    {
+      "name": "a monoscopic sphere the catalogue scanned",
+      "kodi": {
+        "label": "Reef",
+        "width": 3840,
+        "height": 1920,
+        "stereomode": "mono"
+      },
+      "expect": { "packing": 0, "projection": 0, "verdict": "CATALOGUED" },
+      "centreUv": { "left": [0.5, 0.5], "right": [0.5, 0.5] }
+    },
+    {
+      "name": "an over-under sphere the catalogue scanned",
+      "kodi": {
+        "label": "Dive",
+        "width": 3840,
+        "height": 3840,
+        "stereomode": "top_bottom"
+      },
+      "expect": { "packing": 1, "projection": 0, "verdict": "CATALOGUED" },
+      "centreUv": { "left": [0.5, 0.75], "right": [0.5, 0.25] }
+    },
+    {
+      "name": "a side-by-side VR180 recording",
+      "kodi": {
+        "label": "Concert",
+        "width": 7680,
+        "height": 3840,
+        "stereomode": "left_right"
+      },
+      "expect": { "packing": 2, "projection": 1, "verdict": "CATALOGUED" },
+      "centreUv": { "left": [0.25, 0.5], "right": [0.75, 0.5] }
+    },
+    {
+      "name": "an over-under VR180 recording",
+      "kodi": {
+        "label": "Garden",
+        "width": 3840,
+        "height": 7680,
+        "stereomode": "top_bottom"
+      },
+      "expect": { "packing": 1, "projection": 1, "verdict": "CATALOGUED" },
+      "centreUv": { "left": [0.5, 0.75], "right": [0.5, 0.25] }
+    },
+    {
+      "name": "an unscanned file whose name states the packing",
+      "kodi": {
+        "label": "Holiday_TB.mkv",
+        "width": 0,
+        "height": 0,
+        "stereomode": null
+      },
+      "expect": { "packing": 1, "projection": 0, "verdict": "GUESSED" },
+      "centreUv": { "left": [0.5, 0.75], "right": [0.5, 0.25] }
+    },
+    {
+      "name": "an empty stereo mode does not outrank a marked name",
+      "kodi": {
+        "label": "Holiday_TB.mkv",
+        "width": 3840,
+        "height": 1920,
+        "stereomode": ""
+      },
+      "expect": { "packing": 1, "projection": 0, "verdict": "GUESSED" },
+      "centreUv": { "left": [0.5, 0.75], "right": [0.5, 0.25] }
+    },
+    {
+      "name": "a stereo mode nothing can split falls back to inference",
+      "kodi": {
+        "label": "Documentary",
+        "width": 3840,
+        "height": 1920,
+        "stereomode": "anaglyph_cyan_red"
+      },
+      "expect": { "packing": 0, "projection": 0, "verdict": "GUESSED" },
+      "centreUv": { "left": [0.5, 0.5], "right": [0.5, 0.5] }
+    },
+    {
+      "name": "a VR180 file named as such but never scanned",
+      "kodi": {
+        "label": "climb_vr180_sbs.mp4",
+        "width": 0,
+        "height": 0,
+        "stereomode": null
+      },
+      "expect": { "packing": 2, "projection": 1, "verdict": "GUESSED" },
+      "centreUv": { "left": [0.25, 0.5], "right": [0.75, 0.5] }
+    }
+  ]
+}

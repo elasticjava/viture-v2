@@ -26,6 +26,12 @@ glam = { version = "0.33", optional = true }
 # so cross-compiling stays a one-liner.
 miniz_oxide = { version = "0.9", optional = true }
 
+[dev-dependencies]
+# Reading the shared scenario fixture. A development dependency only: it is not
+# part of anything that ships, and the guard on the default build's dependency
+# graph looks at normal edges.
+serde_json = "1"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
