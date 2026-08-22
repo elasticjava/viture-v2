@@ -83,7 +83,10 @@ jobs:
           for symbol in xr_open xr_close xr_state xr_pose7 xr_pose_fresh \
                         xr_recentre xr_set_phone_quat xr_brightness xr_firmware \
                         xr_set_display_mode xr_pano_mesh xr_pano_indices \
-                        xr_pano_uv xr_pano_mvp xr_pano_fov_for_zoom; do
+                        xr_pano_uv xr_pano_mvp xr_pano_fov_for_zoom \
+                        xr_predict xr_angular_rate \
+                        xr_mesh_parse xr_mesh_count xr_mesh_submesh_info \
+                        xr_mesh_copy xr_mesh_free; do
             grep -q " T $symbol\$" exported.txt || { echo "missing: $symbol"; exit 1; }
           done
           echo "all expected symbols present"

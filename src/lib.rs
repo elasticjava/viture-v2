@@ -21,6 +21,8 @@ use core::fmt;
 
 pub mod hidraw;
 #[cfg(feature = "render")]
+pub mod mesh;
+#[cfg(feature = "render")]
 pub mod pano;
 pub mod pointer;
 pub mod ring;
