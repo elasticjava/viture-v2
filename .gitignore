@@ -1,2 +1,6 @@
 /target
 *.log
+
+# Measurement runs: logs, captures and per-step detail. The baseline is kept.
+tools/measurements/*
+!tools/measurements/baseline-mock.tsv

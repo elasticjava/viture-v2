@@ -1,0 +1,9 @@
+glasses product id	0x1301
+battery / charging	85% / true
+battery saver	0
+prediction lookahead	predicting 20,9 ms ahead
+panel and field of view	panel: 1920x1080 an eye, 25,8° vertical
+ods360	st3d=1 0.0, 0.0, 0.0, 0.0
+vr180	st3d=2 0.0, 0.0, 0.25, 0.25
+real360	st3d=1 0.0, 0.0, 0.0, 0.0
+anaglyph	st3d=-1 0.0, 0.0, 0.0, 0.0
