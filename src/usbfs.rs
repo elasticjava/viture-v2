@@ -283,7 +283,17 @@ impl Drop for Usbfs {
                 &mut req as *mut UsbdevfsIoctl as usize,
             );
         }
-        let _ = sys::close(self.fd);
+        // The descriptor is deliberately left open.
+        //
+        // It is always borrowed, never ours: on Android it belongs to a
+        // `UsbDeviceConnection`, and on the command line to `termux-usb`. Closing
+        // it here means it gets closed twice, and Android's fdsan treats that as
+        // fatal — `attempted to close file descriptor N, expected to be unowned`,
+        // followed by SIGABRT. It took down the whole process every time head
+        // tracking shut down.
+        //
+        // Nothing leaks: the owner closes it, and the interface has already been
+        // released and the URBs discarded above.
     }
 }
 
