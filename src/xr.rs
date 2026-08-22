@@ -53,6 +53,10 @@ pub struct XrState {
 #[derive(Default)]
 struct Hot {
     head: [AtomicU32; 4],
+    /// Version counters for [`Hot::head`] and [`Hot::phone`]. Odd while a write
+    /// is in progress; see [`Hot::store_quat`].
+    head_seq: AtomicU32,
+    phone_seq: AtomicU32,
     /// Set while the reader thread is alive, cleared when it leaves.
     reader_alive: AtomicBool,
     /// Errno of the error that ended the reader, or 0.
@@ -70,13 +74,54 @@ struct Hot {
 }
 
 impl Hot {
-    fn store_quat(slot: &[AtomicU32; 4], q: [f32; 4]) {
+    /// Publishes a quaternion so that no reader can see half of it.
+    ///
+    /// Four atomics written one at a time are not one atomic write, and this
+    /// used to be exactly that: the reader thread stored w, x, y, z separately
+    /// at 119 Hz while the render thread read them separately once a frame. A
+    /// reader landing in the middle got w from one pose and x from the next,
+    /// which is not a rotation — the components differ most during fast head
+    /// movement, so the error was largest exactly when it was most visible.
+    ///
+    /// A sequence lock fixes it without a mutex, which matters on a path the
+    /// renderer touches every frame and the reader touches every 8 ms. The
+    /// counter goes odd before the write and even after; a reader that sees an
+    /// odd counter, or a different one afterwards, tries again.
+    fn store_quat(seq: &AtomicU32, slot: &[AtomicU32; 4], q: [f32; 4]) {
+        let version = seq.load(Ordering::Relaxed);
+        // Odd: a write is in progress. Release so the stores below cannot be
+        // seen before it.
+        seq.store(version.wrapping_add(1), Ordering::Release);
         for (a, v) in slot.iter().zip(q) {
             a.store(v.to_bits(), Ordering::Relaxed);
         }
+        // Even again, and Release so the stores are visible before it is.
+        seq.store(version.wrapping_add(2), Ordering::Release);
     }
 
-    fn load_quat(slot: &[AtomicU32; 4]) -> [f32; 4] {
+    /// Reads a quaternion that was whole at some instant.
+    ///
+    /// Retries a bounded number of times rather than spinning: the writer holds
+    /// the lock for four stores, so a reader is unlucky to lose once and
+    /// essentially cannot lose repeatedly. Giving up returns the components as
+    /// they are — which is what the old code always did — because a stale-ish
+    /// pose beats blocking a frame.
+    fn load_quat(seq: &AtomicU32, slot: &[AtomicU32; 4]) -> [f32; 4] {
+        for _ in 0..LOAD_RETRIES {
+            let before = seq.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                // A write is in progress; let it finish.
+                core::hint::spin_loop();
+                continue;
+            }
+            let mut q = [0f32; 4];
+            for (i, a) in slot.iter().enumerate() {
+                q[i] = f32::from_bits(a.load(Ordering::Relaxed));
+            }
+            if seq.load(Ordering::Acquire) == before {
+                return q;
+            }
+        }
         let mut q = [0f32; 4];
         for (i, a) in slot.iter().enumerate() {
             q[i] = f32::from_bits(a.load(Ordering::Relaxed));
@@ -237,11 +282,28 @@ impl Tracker {
             Ok("both") => Streams::POSE.with(Streams::RAW),
             _ => Streams::POSE,
         };
-        dev.set_imu(streams, rate)?;
+        // Starting the stream is the one step here that must succeed, and a
+        // single flaky read used to be enough to fail it — on a cable that
+        // would have worked perfectly a moment later. Retried, because the
+        // difference between "this device is not there" and "that read went
+        // wrong" is not visible in one attempt.
+        let mut attempt = 0;
+        loop {
+            match dev.set_imu(streams, rate) {
+                Ok(()) => break,
+                Err(e) if is_fatal(&e) => return Err(e),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= OPEN_ATTEMPTS {
+                        return Err(e);
+                    }
+                }
+            }
+        }
 
         let hot = Arc::new(Hot::default());
-        Hot::store_quat(&hot.head, [1.0, 0.0, 0.0, 0.0]);
-        Hot::store_quat(&hot.phone, [1.0, 0.0, 0.0, 0.0]);
+        Hot::store_quat(&hot.head_seq, &hot.head, [1.0, 0.0, 0.0, 0.0]);
+        Hot::store_quat(&hot.phone_seq, &hot.phone, [1.0, 0.0, 0.0, 0.0]);
 
         let stop = Arc::new(AtomicBool::new(false));
         let raw_stream = streams.has(Streams::RAW);
@@ -272,7 +334,7 @@ impl Tracker {
     /// `[roll, pitch, yaw, qw, qx, qy, qz]`, Euler angles in degrees.
     /// This is what a host that does its own recentring wants.
     pub fn pose7(&self) -> [f32; 7] {
-        let q = Hot::load_quat(&self.hot.head);
+        let q = Hot::load_quat(&self.hot.head_seq, &self.hot.head);
         let [roll, pitch, yaw] = crate::Pose { tick: 0, q }.euler_deg();
         [roll, pitch, yaw, q[0], q[1], q[2], q[3]]
     }
@@ -320,7 +382,7 @@ impl Tracker {
 
     /// Feeds the phone orientation, e.g. from `TYPE_GAME_ROTATION_VECTOR`.
     pub fn set_phone_quat(&self, q: [f32; 4]) {
-        Hot::store_quat(&self.hot.phone, q);
+        Hot::store_quat(&self.hot.phone_seq, &self.hot.phone, q);
         self.hot.phone_samples.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -329,8 +391,8 @@ impl Tracker {
     /// The head reference is heading-only; the phone reference is the full
     /// orientation, because the pointer is expressed in the head frame anyway.
     pub fn recentre(&self) {
-        let head = Hot::load_quat(&self.hot.head);
-        let phone = Hot::load_quat(&self.hot.phone);
+        let head = Hot::load_quat(&self.hot.head_seq, &self.hot.head);
+        let phone = Hot::load_quat(&self.hot.phone_seq, &self.hot.phone);
         if let Ok(mut c) = self.cold.lock() {
             c.ref_yaw = yaw_twist(head);
             // The head handed to the pointer is already recentred, so its own
@@ -353,9 +415,9 @@ impl Tracker {
 
     /// One snapshot for the current frame.
     pub fn state(&self) -> XrState {
-        let head = Hot::load_quat(&self.hot.head);
+        let head = Hot::load_quat(&self.hot.head_seq, &self.hot.head);
         let gyro = Hot::load_vec3(&self.hot.gyro);
-        let phone = Hot::load_quat(&self.hot.phone);
+        let phone = Hot::load_quat(&self.hot.phone_seq, &self.hot.phone);
 
         let (relative, lookahead, cursor) = match self.cold.lock() {
             Ok(c) => {
@@ -398,6 +460,51 @@ impl Drop for Tracker {
     }
 }
 
+/// How many times a reader retries a torn quaternion before taking what is
+/// there. The writer holds the lock for four stores, so losing twice in a row
+/// is already improbable and losing eight times is not a thing that happens.
+const LOAD_RETRIES: u32 = 8;
+
+/// How many times to ask the device to start streaming before giving up.
+///
+/// Each attempt is a command and a reply with its own timeout, so this is
+/// seconds at worst and only on a device that is genuinely not answering. The
+/// alternative — one attempt — meant a cable that hiccupped at the wrong moment
+/// looked exactly like no glasses at all.
+const OPEN_ATTEMPTS: u32 = 5;
+
+/// How many reads may fail in a row before the stream is called dead.
+///
+/// At a 50 ms poll timeout this is a couple of seconds of nothing working —
+/// far longer than any glitch and far shorter than a person's patience. Low
+/// enough that a genuinely dead device does not spin, high enough that a cable
+/// being flexed does not end the session.
+const MAX_CONSECUTIVE_ERRORS: u32 = 40;
+
+/// Whether an error means the device has gone, as opposed to a read having gone
+/// wrong.
+///
+/// Worth drawing precisely: wrong in one direction this ends a working session,
+/// wrong in the other it spins forever on a device that is not there.
+///
+/// Gone — the descriptor no longer refers to anything. Unplugged, or the kernel
+/// tore the interface down; nothing that follows can succeed.
+///
+/// Not gone — a frame that did not parse, a checksum that did not match, a
+/// timeout, a transfer the bus gave up on. All survivable, several routine on a
+/// bus shared with a video stream.
+fn is_fatal(error: &crate::Error) -> bool {
+    match error {
+        crate::Error::Io(io) => matches!(
+            io.raw_os_error(),
+            // ENOENT, EBADF, ENODEV, EPIPE, ESHUTDOWN. usbfs reports ENODEV on
+            // an unplug, which is the one that matters.
+            Some(2) | Some(9) | Some(19) | Some(32) | Some(108)
+        ),
+        _ => false,
+    }
+}
+
 fn read_loop<T: Transport>(
     mut dev: Device<T>,
     hot: Arc<Hot>,
@@ -407,6 +514,8 @@ fn read_loop<T: Transport>(
     hot.reader_alive.store(true, Ordering::Release);
     // Previous pose and when it arrived, for estimating angular rate.
     let mut previous: Option<([f32; 4], std::time::Instant)> = None;
+    // Errors since the last read that worked. Cleared by any success.
+    let mut consecutive_errors: u32 = 0;
     while !stop.load(Ordering::Relaxed) {
         // Send a queued display-mode change between reads — the only place the
         // transport is free.
@@ -416,7 +525,8 @@ fn read_loop<T: Transport>(
         }
         match dev.next_event(50_000_000) {
             Ok(Some(Event::Pose(p))) => {
-                Hot::store_quat(&hot.head, p.q);
+                consecutive_errors = 0;
+                Hot::store_quat(&hot.head_seq, &hot.head, p.q);
                 hot.head_samples.fetch_add(1, Ordering::Relaxed);
                 hot.fresh.store(true, Ordering::Release);
 
@@ -455,23 +565,45 @@ fn read_loop<T: Transport>(
                 }
             }
             Ok(Some(Event::Raw(r))) => {
+                consecutive_errors = 0;
                 for (a, v) in hot.gyro.iter().zip(r.gyro) {
                     a.store(v.to_bits(), Ordering::Relaxed);
                 }
             }
             Ok(Some(Event::Other(_))) => {
+                consecutive_errors = 0;
                 hot.other_events.fetch_add(1, Ordering::Relaxed);
             }
-            Ok(None) => {}
+            Ok(None) => {
+                consecutive_errors = 0;
+            }
             Err(e) => {
-                // Record why the reader gave up. Silence here was impossible to
-                // diagnose from the outside.
+                // Record why, whether or not it proves fatal. Silence here was
+                // impossible to diagnose from the outside.
                 let code = match &e {
                     crate::Error::Io(io) => io.raw_os_error().unwrap_or(-1),
                     _ => -2,
                 };
                 hot.reader_errno.store(code as u32, Ordering::Relaxed);
-                break;
+
+                // Whether to stop. This used to stop on anything at all, which
+                // meant one flaky read ended head tracking for the whole
+                // session — and a cable in a pocket produces those. The
+                // watchdogs upstairs exist because of it.
+                //
+                // A device that has gone is worth stopping for; a read that
+                // went wrong is not. What separates them is not the error alone
+                // but whether anything works afterwards, so transient errors
+                // are counted and the count is cleared by the next success.
+                // Persistent failure still ends the loop, on evidence rather
+                // than on suspicion.
+                if is_fatal(&e) {
+                    break;
+                }
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    break;
+                }
             }
         }
     }

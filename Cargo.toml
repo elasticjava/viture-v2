@@ -42,6 +42,10 @@ name = "simulated_view"
 required-features = ["render"]
 
 [[test]]
+name = "chaos"
+required-features = ["sim"]
+
+[[test]]
 name = "simulation_matches_hardware"
 required-features = ["sim"]
 

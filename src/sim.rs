@@ -41,7 +41,9 @@
 //! * **The panel goes dark when nobody is wearing it.** Which reads, from the
 //!   host, exactly like a display that has failed.
 
-use crate::{build, msg, Error, Rate, Result, Streams, Transport, FRAME_MAX, RESPONSE_OFFSET};
+use crate::{
+    build, msg, Error, Rate, Result, Streams, Transport, FRAME_MAX, HEADER_LEN, RESPONSE_OFFSET,
+};
 
 /// Where the head is at a given moment.
 pub trait Trajectory: Send {
@@ -459,5 +461,176 @@ impl Transport for Failing {
 
     fn recv(&mut self, _buf: &mut [u8; FRAME_MAX], _timeout_ns: u64) -> Result<usize> {
         Err(Error::Io(std::io::Error::from_raw_os_error(19)))
+    }
+}
+
+/// A transport that misbehaves, so the stack above it can be made to prove it
+/// copes.
+///
+/// The simulation up to here is a *well-behaved* pair of glasses: every frame
+/// arrives, intact, on time. Real ones hang off a thin cable in someone's
+/// pocket, sharing a bus with a video stream, on a phone that is also
+/// scheduling forty other things. What goes wrong there is not exotic, and none
+/// of it is reachable by unplugging something on purpose and hoping the timing
+/// is right.
+///
+/// So the faults are injected deliberately and deterministically. Every one of
+/// them is something the hardware was seen doing or is documented as doing:
+///
+/// * **A cable that is failing rather than failed.** Reads return `EIO` some of
+///   the time and work the rest. The interesting case is not the disconnection
+///   — that is obvious and handled — but the connection that mostly works,
+///   because that is the one where a retry loop can spin forever or a watchdog
+///   can never quite decide the stream is dead.
+/// * **A load spike.** The phone stalls the reader for a while and then hands
+///   over everything that queued up at once. Anything computing a rate from the
+///   gap between two poses sees an interval far longer than any real head
+///   movement, and anything predicting from it will fly off unless it refuses.
+/// * **A poor connection.** Frames arrive corrupted: a flipped bit in the
+///   payload, a wrong checksum, a truncated read. These must be dropped, not
+///   parsed — a corrupt quaternion is a head that has just teleported.
+/// * **A stream that dies while the device still answers.** Already covered by
+///   [`Simulated::stall`], and folded in here so a test can combine it with the
+///   rest.
+///
+/// Deterministic by construction: faults are driven by a counter, not a random
+/// number generator, so a failure reproduces exactly. `every` of 3 means every
+/// third read, and 0 means never.
+pub struct Faulty {
+    inner: Simulated,
+    plan: Faults,
+    /// Reads so far, which is what the schedule counts.
+    reads: u64,
+    /// Frames withheld during a stall, to be delivered in a burst.
+    withheld: u32,
+}
+
+/// Which faults to inject, and how often.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Faults {
+    /// Every nth read fails with an I/O error. 0 for never.
+    pub io_error_every: u64,
+    /// Every nth read returns a frame with a corrupted payload. 0 for never.
+    pub corrupt_every: u64,
+    /// Every nth read returns fewer bytes than a frame needs. 0 for never.
+    pub truncate_every: u64,
+    /// Every nth read is a load spike: the reader is starved for
+    /// [`Faults::spike_frames`] samples, which then arrive back to back.
+    pub spike_every: u64,
+    /// How many samples a spike withholds.
+    pub spike_frames: u32,
+}
+
+impl Faults {
+    /// A cable on its way out: one read in five fails, nothing else.
+    pub const FAILING_CABLE: Faults = Faults {
+        io_error_every: 5,
+        ..Faults::NONE
+    };
+
+    /// A busy phone: a spike every fiftieth read, holding back a tenth of a
+    /// second of poses and then releasing them together.
+    pub const LOAD_SPIKES: Faults = Faults {
+        spike_every: 50,
+        spike_frames: 12,
+        ..Faults::NONE
+    };
+
+    /// A connection that is passing traffic but mangling it.
+    pub const POOR_SIGNAL: Faults = Faults {
+        corrupt_every: 7,
+        truncate_every: 11,
+        ..Faults::NONE
+    };
+
+    /// Everything at once, which is not paranoia: a phone under load with a
+    /// cable being flexed does all of this in the same second.
+    pub const EVERYTHING: Faults = Faults {
+        io_error_every: 5,
+        corrupt_every: 7,
+        truncate_every: 11,
+        spike_every: 50,
+        spike_frames: 12,
+    };
+
+    pub const NONE: Faults = Faults {
+        io_error_every: 0,
+        corrupt_every: 0,
+        truncate_every: 0,
+        spike_every: 0,
+        spike_frames: 0,
+    };
+}
+
+impl Faulty {
+    pub fn new(inner: Simulated, plan: Faults) -> Faulty {
+        Faulty {
+            inner,
+            plan,
+            reads: 0,
+            withheld: 0,
+        }
+    }
+
+    /// The device underneath, for asserting on what it was told.
+    pub fn device(&self) -> &Simulated {
+        &self.inner
+    }
+
+    /// Whether `every` fires on this read. A period of 0 never fires.
+    fn due(&self, every: u64) -> bool {
+        every != 0 && self.reads.is_multiple_of(every)
+    }
+}
+
+impl Transport for Faulty {
+    fn send(&mut self, frame: &[u8]) -> Result<()> {
+        // Commands go through untouched. A cable bad enough to lose them is a
+        // cable the driver cannot work with at all, and the reply timeout
+        // already covers that case.
+        self.inner.send(frame)
+    }
+
+    fn recv(&mut self, buf: &mut [u8; FRAME_MAX], timeout_ns: u64) -> Result<usize> {
+        self.reads += 1;
+
+        if self.due(self.plan.io_error_every) {
+            // EIO: the read reached the kernel and the device did not answer,
+            // which is what a cable losing contact looks like from up here.
+            return Err(Error::Io(std::io::Error::from_raw_os_error(5)));
+        }
+
+        if self.due(self.plan.spike_every) && self.plan.spike_frames > 0 {
+            // The reader was starved. Advance the device's clock past the
+            // samples nobody collected, so the next pose is where the head
+            // really is rather than where it was before the stall — which is
+            // what makes the gap visible to whatever measures it.
+            self.withheld = self.plan.spike_frames;
+            for _ in 0..self.plan.spike_frames {
+                let mut discard = [0u8; FRAME_MAX];
+                let _ = self.inner.recv(&mut discard, timeout_ns);
+            }
+        }
+        if self.withheld > 0 {
+            self.withheld -= 1;
+        }
+
+        let n = self.inner.recv(buf, timeout_ns)?;
+
+        if self.due(self.plan.truncate_every) {
+            // Half a frame. The header says one length and the read returned
+            // another, which is what a bus reset in the middle of a transfer
+            // looks like.
+            return Ok(n / 2);
+        }
+
+        if self.due(self.plan.corrupt_every) && n > HEADER_LEN {
+            // One flipped bit in the payload, which leaves the length right and
+            // the checksum wrong. The subtle case: everything about the frame
+            // looks plausible except the one field that says it is not.
+            buf[HEADER_LEN] ^= 0x01;
+        }
+
+        Ok(n)
     }
 }
