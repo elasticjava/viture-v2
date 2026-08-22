@@ -767,12 +767,17 @@ pub fn cubemap_indices(cells: u32, out: &mut [u16]) -> Option<usize> {
                 let b = a + 1;
                 let c = a + stride as u16;
                 let d = c + 1;
+                // Wound counter-clockwise *seen from the centre*, which is
+                // where the viewer is. The obvious order — a, c, d — is
+                // counter-clockwise seen from outside, and outside is where
+                // nobody is standing: with back-face culling on, every face of
+                // the cube faced away and the whole thing rendered as black.
                 out[w] = a;
-                out[w + 1] = c;
-                out[w + 2] = d;
+                out[w + 1] = d;
+                out[w + 2] = c;
                 out[w + 3] = a;
-                out[w + 4] = d;
-                out[w + 5] = b;
+                out[w + 4] = b;
+                out[w + 5] = d;
                 w += 6;
             }
         }
@@ -2174,6 +2179,42 @@ mod tests {
         assert_eq!(corners.len(), 8, "a cube has eight corners");
         for (corner, faces) in corners {
             assert_eq!(faces, 3, "corner {corner:?} is built by {faces} faces");
+        }
+    }
+
+    #[test]
+    fn every_cube_triangle_faces_the_viewer_at_the_centre() {
+        // The sphere has this test and the cube did not, which is why the cube
+        // shipped inside out: every face wound away from the middle, back-face
+        // culling discarded all six, and the panel went black with the geometry
+        // uploaded and nothing to say about it.
+        //
+        // The check is the sign of the triangle's normal against the direction
+        // to it. Positive means it faces the centre, which is where the viewer
+        // is standing.
+        let cells = 2;
+        let verts = cube(cells, 0.0);
+        let mut idx = vec![0u16; cubemap_index_count(cells)];
+        cubemap_indices(cells, &mut idx).unwrap();
+
+        for (n, triangle) in idx.as_chunks::<3>().0.iter().enumerate() {
+            let p = triangle.map(|i| {
+                let o = i as usize * VERTEX_FLOATS;
+                [verts[o], verts[o + 1], verts[o + 2]]
+            });
+            let edge1 = [p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]];
+            let edge2 = [p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]];
+            let normal = [
+                edge1[1] * edge2[2] - edge1[2] * edge2[1],
+                edge1[2] * edge2[0] - edge1[0] * edge2[2],
+                edge1[0] * edge2[1] - edge1[1] * edge2[0],
+            ];
+            // Any point of the triangle serves as the direction from the centre.
+            let facing = normal[0] * p[0][0] + normal[1] * p[0][1] + normal[2] * p[0][2];
+            assert!(
+                facing < 0.0,
+                "triangle {n} faces away from the centre ({facing}); the cube is inside out",
+            );
         }
     }
 
