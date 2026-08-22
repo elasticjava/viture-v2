@@ -63,6 +63,48 @@ impl StereoLayout {
     }
 }
 
+/// How much of the sphere the footage covers.
+///
+/// Everything here is equirectangular; the difference is the arc. Mesh
+/// projections — the `mshp` box a fisheye rig writes — are a third case that
+/// needs the mesh out of the file and is not handled.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum Projection {
+    /// The full sphere: 360° across, 180° down.
+    Equirect360 = 0,
+    /// The front half only: 180° across, 180° down.
+    ///
+    /// This is what VR180 rigs shoot, and it is most of the stereoscopic
+    /// material that exists, because two forward-facing lenses can be given a
+    /// real interocular distance where a full-sphere rig cannot. Only the
+    /// hemisphere is built, so turning round shows the background rather than
+    /// the footage smeared across geometry it was never meant to cover.
+    Equirect180 = 1,
+}
+
+impl Projection {
+    pub fn from_raw(v: u32) -> Projection {
+        match v {
+            1 => Projection::Equirect180,
+            _ => Projection::Equirect360,
+        }
+    }
+
+    /// The longitude the image spans, in radians.
+    fn arc(self) -> f32 {
+        match self {
+            Projection::Equirect360 => std::f32::consts::TAU,
+            Projection::Equirect180 => std::f32::consts::PI,
+        }
+    }
+
+    /// Whether the last column of the grid meets the first.
+    fn wraps(self) -> bool {
+        self == Projection::Equirect360
+    }
+}
+
 /// Which eye a frame is being drawn for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(i32)]
@@ -131,6 +173,9 @@ pub const fn vertex_count(rings: u32, sectors: u32) -> usize {
 
 /// Number of indices [`sphere_indices`] will write for this tessellation.
 ///
+/// Independent of the projection: a hemisphere uses the same grid, stretched
+/// over half the longitude.
+///
 /// Two triangles per grid cell, except along the two polar rows where one
 /// corner of the cell collapses onto the pole and one of the two triangles has
 /// no area. Those are skipped: a degenerate triangle costs a primitive-assembly
@@ -152,11 +197,18 @@ pub const fn index_count(rings: u32, sectors: u32) -> usize {
 /// `rings` counts latitude bands and `sectors` counts longitude bands. 64 × 128
 /// is a good default: the residual faceting is finer than the panel resolves,
 /// and the whole mesh is under 200 kB.
-pub fn sphere_mesh(rings: u32, sectors: u32, radius: f32, out: &mut [f32]) -> Option<usize> {
+pub fn sphere_mesh(
+    rings: u32,
+    sectors: u32,
+    radius: f32,
+    projection: Projection,
+    out: &mut [f32],
+) -> Option<usize> {
     let count = vertex_count(rings, sectors);
     if rings < 2 || sectors < 3 || count > MAX_VERTICES || out.len() < count * VERTEX_FLOATS {
         return None;
     }
+    let arc = projection.arc();
 
     let mut w = 0;
     for ring in 0..=rings {
@@ -173,8 +225,10 @@ pub fn sphere_mesh(rings: u32, sectors: u32, radius: f32, out: &mut [f32]) -> Op
 
         for sector in 0..=sectors {
             let u = sector as f32 / sectors as f32;
-            // Longitude, zero straight ahead so the image centre is straight ahead.
-            let lon = (u - 0.5) * std::f32::consts::TAU;
+            // Longitude, zero straight ahead so the image centre is straight
+            // ahead. The image always spans the full `u` range; what changes
+            // between projections is how much world that is.
+            let lon = (u - 0.5) * arc;
             let (sin_lon, cos_lon) = lon.sin_cos();
 
             out[w] = r * sin_lon;
@@ -338,6 +392,8 @@ pub extern "C" fn xr_pano_index_count(rings: u32, sectors: u32) -> u32 {
 /// Fills `out` with interleaved `[x, y, z, u, v]` vertices. Returns the vertex
 /// count, or -1 if the tessellation or the capacity is unusable.
 ///
+/// `projection` is 0 for a full sphere and 1 for the VR180 front hemisphere.
+///
 /// # Safety
 /// `out` must point to `cap_floats` writable, aligned `f32`s.
 #[no_mangle]
@@ -345,6 +401,7 @@ pub unsafe extern "C" fn xr_pano_mesh(
     rings: u32,
     sectors: u32,
     radius: f32,
+    projection: u32,
     out: *mut f32,
     cap_floats: usize,
 ) -> i32 {
@@ -352,7 +409,14 @@ pub unsafe extern "C" fn xr_pano_mesh(
         return -1;
     }
     let slice = std::slice::from_raw_parts_mut(out, cap_floats);
-    sphere_mesh(rings, sectors, radius, slice).map_or(-1, |n| n as i32)
+    sphere_mesh(
+        rings,
+        sectors,
+        radius,
+        Projection::from_raw(projection),
+        slice,
+    )
+    .map_or(-1, |n| n as i32)
 }
 
 /// Fills `out` with triangle indices. Returns the index count, or -1.
@@ -452,7 +516,7 @@ mod tests {
         let mut verts = vec![0.0f32; vertex_count(RINGS, SECTORS) * VERTEX_FLOATS];
         let mut idx = vec![0u16; index_count(RINGS, SECTORS)];
         assert_eq!(
-            sphere_mesh(RINGS, SECTORS, 1.0, &mut verts),
+            sphere_mesh(RINGS, SECTORS, 1.0, Projection::Equirect360, &mut verts),
             Some(vertex_count(RINGS, SECTORS))
         );
         assert_eq!(
@@ -583,6 +647,63 @@ mod tests {
     }
 
     #[test]
+    fn a_hemisphere_spans_half_the_longitude() {
+        // VR180 puts the whole image in front of you. If the arc were still a
+        // full turn the footage would wrap round the back at half scale, which
+        // looks plausible enough in a screenshot to survive review.
+        let mut verts = vec![0.0f32; vertex_count(RINGS, SECTORS) * VERTEX_FLOATS];
+        assert!(sphere_mesh(RINGS, SECTORS, 1.0, Projection::Equirect180, &mut verts).is_some());
+        let column = |u: f32| {
+            *verts
+                .as_chunks::<VERTEX_FLOATS>()
+                .0
+                .iter()
+                .find(|c| (c[3] - u).abs() < 1e-6 && (c[4] - 0.5).abs() < 1e-6)
+                .unwrap()
+        };
+        // The centre still looks straight ahead.
+        let middle = column(0.5);
+        assert!(
+            middle[0].abs() < 1e-5 && (middle[2] + 1.0).abs() < 1e-5,
+            "{middle:?}"
+        );
+        // The edges reach a quarter turn each way, not half.
+        let right = column(1.0);
+        assert!((right[0] - 1.0).abs() < 1e-4, "right edge x {}", right[0]);
+        assert!(right[2].abs() < 1e-4, "right edge z {}", right[2]);
+        let left = column(0.0);
+        assert!((left[0] + 1.0).abs() < 1e-4, "left edge x {}", left[0]);
+    }
+
+    #[test]
+    fn a_hemisphere_still_faces_inward() {
+        // The winding must survive the narrower arc, or VR180 renders black.
+        let mut verts = vec![0.0f32; vertex_count(RINGS, SECTORS) * VERTEX_FLOATS];
+        let mut idx = vec![0u16; index_count(RINGS, SECTORS)];
+        sphere_mesh(RINGS, SECTORS, 1.0, Projection::Equirect180, &mut verts).unwrap();
+        sphere_indices(RINGS, SECTORS, &mut idx).unwrap();
+        for tri in idx.as_chunks::<3>().0 {
+            let a = pos(&verts, tri[0]);
+            let b = pos(&verts, tri[1]);
+            let c = pos(&verts, tri[2]);
+            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let n = [
+                ab[1] * ac[2] - ab[2] * ac[1],
+                ab[2] * ac[0] - ab[0] * ac[2],
+                ab[0] * ac[1] - ab[1] * ac[0],
+            ];
+            let facing = n[0] * a[0] + n[1] * a[1] + n[2] * a[2];
+            // Polar triangles collapse to a sliver on a hemisphere; only judge
+            // the ones with area worth judging.
+            let area = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            if area > 1e-6 {
+                assert!(facing <= 0.0, "outward-facing triangle ({facing})");
+            }
+        }
+    }
+
+    #[test]
     fn indices_stay_in_range() {
         let (_, idx) = build();
         let max = vertex_count(RINGS, SECTORS) as u16;
@@ -593,13 +714,28 @@ mod tests {
     fn tessellation_is_validated() {
         let mut verts = vec![0.0f32; 1 << 20];
         let mut idx = vec![0u16; 1 << 20];
-        assert_eq!(sphere_mesh(1, 64, 1.0, &mut verts), None, "one ring");
-        assert_eq!(sphere_mesh(32, 2, 1.0, &mut verts), None, "two sectors");
-        assert_eq!(sphere_mesh(512, 512, 1.0, &mut verts), None, "over 16-bit");
+        assert_eq!(
+            sphere_mesh(1, 64, 1.0, Projection::Equirect360, &mut verts),
+            None,
+            "one ring"
+        );
+        assert_eq!(
+            sphere_mesh(32, 2, 1.0, Projection::Equirect360, &mut verts),
+            None,
+            "two sectors"
+        );
+        assert_eq!(
+            sphere_mesh(512, 512, 1.0, Projection::Equirect360, &mut verts),
+            None,
+            "over 16-bit"
+        );
         assert_eq!(sphere_indices(512, 512, &mut idx), None, "over 16-bit");
         // Short output slices are rejected rather than half-filled.
         let mut tiny = [0.0f32; 4];
-        assert_eq!(sphere_mesh(RINGS, SECTORS, 1.0, &mut tiny), None);
+        assert_eq!(
+            sphere_mesh(RINGS, SECTORS, 1.0, Projection::Equirect360, &mut tiny),
+            None
+        );
         let mut tiny_idx = [0u16; 4];
         assert_eq!(sphere_indices(RINGS, SECTORS, &mut tiny_idx), None);
     }
