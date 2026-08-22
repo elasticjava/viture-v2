@@ -73,13 +73,36 @@ pub enum Eye {
 
 /// Field of view limits, in degrees of vertical angle.
 ///
-/// The glasses' optics span about 46° vertically, so the neutral value is the
-/// one that makes the panorama look life-size. Zooming in narrows the angle;
-/// below ten degrees the head tracking's own jitter becomes the dominant motion
-/// on screen and the image feels unstable, which is where the floor comes from.
+/// Zooming in narrows the angle; below ten degrees the head tracking's own
+/// jitter becomes the dominant motion on screen and the image stops feeling
+/// stable, which is where the floor comes from. The ceiling is well past
+/// anything comfortable and exists only to bound the arithmetic.
 pub const MIN_FOV_DEG: f32 = 10.0;
 pub const MAX_FOV_DEG: f32 = 100.0;
-pub const DEFAULT_FOV_DEG: f32 = 46.0;
+
+/// Diagonal field of view of the panel, in degrees.
+///
+/// This is the number optics are sold on — 50° for the Pro 2, 46° for the Pro —
+/// and it is always the diagonal, never the vertical. Taking it for the vertical
+/// angle renders roughly twice as much world into the same optics, and the
+/// panorama comes out at half life size: recognisably a picture of a place
+/// rather than the place.
+pub const PANEL_DIAGONAL_FOV_DEG: f32 = 50.0;
+
+/// The vertical angle that makes a panorama life-size: the same 25.8° the panel
+/// actually spans, for a 16:9 frame with [`PANEL_DIAGONAL_FOV_DEG`] across its
+/// diagonal. Checked against [`vertical_fov`] in the tests rather than trusted.
+pub const DEFAULT_FOV_DEG: f32 = 25.76;
+
+/// The vertical field of view of a screen quoted by its diagonal.
+///
+/// The half-height of a rectangle is `1 / sqrt(1 + aspect²)` of its
+/// half-diagonal, and the tangents scale with it.
+pub fn vertical_fov(diagonal_deg: f32, aspect: f32) -> f32 {
+    let half_diagonal = (diagonal_deg.to_radians() * 0.5).tan();
+    let half_height = half_diagonal / (1.0 + aspect * aspect).sqrt();
+    2.0 * half_height.atan().to_degrees()
+}
 
 /// The sphere is unit-radius and drawn without depth, so the near and far
 /// planes only have to bracket it.
@@ -602,8 +625,26 @@ mod tests {
     }
 
     #[test]
+    fn the_default_field_of_view_is_the_panel_s_own() {
+        // A panorama is life-size only when the rendered angle matches the angle
+        // the optics span. The constant is spelled out for readability; this
+        // keeps it honest.
+        let derived = vertical_fov(PANEL_DIAGONAL_FOV_DEG, 16.0 / 9.0);
+        assert!(
+            (derived - DEFAULT_FOV_DEG).abs() < 0.02,
+            "derived {derived}, constant {DEFAULT_FOV_DEG}"
+        );
+        // A square screen's vertical angle is its diagonal scaled by 1/sqrt(2).
+        let square = vertical_fov(90.0, 1.0);
+        let expected = 2.0 * (45f32.to_radians().tan() / 2f32.sqrt()).atan().to_degrees();
+        assert!((square - expected).abs() < 1e-3, "square {square}");
+    }
+
+    #[test]
     fn zoom_and_fov_are_inverses_inside_the_clamp() {
-        for zoom in [0.5f32, 1.0, 2.0, 4.0] {
+        // Inside the clamp: at a 25.8° neutral angle, 2.6x is where zooming in
+        // hits the 10° floor.
+        for zoom in [0.4f32, 1.0, 2.0, 2.5] {
             let fov = fov_for_zoom(zoom);
             assert!(
                 (zoom_for_fov(fov) - zoom).abs() < 1e-4,
@@ -613,6 +654,7 @@ mod tests {
         assert_eq!(fov_for_zoom(1.0), DEFAULT_FOV_DEG);
         assert_eq!(fov_for_zoom(1000.0), MIN_FOV_DEG, "clamped in");
         assert_eq!(fov_for_zoom(0.0001), MAX_FOV_DEG, "clamped out");
+        assert_eq!(fov_for_zoom(4.0), MIN_FOV_DEG, "past the floor");
         assert_eq!(fov_for_zoom(f32::NAN), DEFAULT_FOV_DEG);
         assert_eq!(fov_for_zoom(-1.0), DEFAULT_FOV_DEG);
     }

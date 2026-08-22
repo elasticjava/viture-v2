@@ -89,6 +89,12 @@ impl Streams {
     pub const fn with(self, other: Streams) -> Streams {
         Streams(self.0 | other.0)
     }
+
+    /// Whether every stream in `other` is part of this set.
+    #[inline]
+    pub const fn has(self, other: Streams) -> bool {
+        self.0 & other.0 == other.0
+    }
 }
 
 /// Reporting rate. The Pro 2 supports raw up to 1000 Hz, pose only to 240 Hz.

@@ -111,6 +111,38 @@ struct Cold {
 /// Marks [`Hot::pending_mode`] as carrying a request rather than being idle.
 const PENDING_SET: u32 = 0x100;
 
+/// How much of each newly measured angular rate to keep, per sample at 120 Hz.
+///
+/// Differentiating positions amplifies their noise, and prediction turns rate
+/// noise straight into a restless image. A third per sample settles within a
+/// couple of frames — fast enough that a head turn is not damped, slow enough
+/// that a stationary head does not shimmer.
+const RATE_SMOOTHING: f32 = 0.33;
+
+/// Body-frame angular velocity, in radians per second, between two orientations
+/// `dt` apart.
+///
+/// The rotation from one to the other is `conj(a) * b`; for a small rotation its
+/// vector part is half the axis-angle, so the rate is twice that over `dt`. The
+/// sign is normalised to the shorter arc, since `q` and `-q` are the same
+/// orientation and the difference between them is half a turn.
+#[inline]
+fn angular_rate(a: [f32; 4], b: [f32; 4], dt: f32) -> [f32; 3] {
+    let [aw, ax, ay, az] = a;
+    let [bw, bx, by, bz] = b;
+    let mut d = [
+        aw * bw + ax * bx + ay * by + az * bz,
+        aw * bx - ax * bw - ay * bz + az * by,
+        aw * by + ax * bz - ay * bw - az * bx,
+        aw * bz - ax * by + ay * bx - az * bw,
+    ];
+    if d[0] < 0.0 {
+        d = [-d[0], -d[1], -d[2], -d[3]];
+    }
+    let k = 2.0 / dt;
+    [d[1] * k, d[2] * k, d[3] * k]
+}
+
 /// Cancels the reference heading from an orientation: `conj(yaw_twist) * q`,
 /// with `yaw_twist = (cos, 0, sin, 0)`.
 #[inline]
@@ -196,10 +228,11 @@ impl Tracker {
         Hot::store_quat(&hot.phone, [1.0, 0.0, 0.0, 0.0]);
 
         let stop = Arc::new(AtomicBool::new(false));
+        let raw_stream = streams.has(Streams::RAW);
         let reader = {
             let hot = Arc::clone(&hot);
             let stop = Arc::clone(&stop);
-            std::thread::spawn(move || read_loop(dev, hot, stop))
+            std::thread::spawn(move || read_loop(dev, hot, stop, raw_stream))
         };
 
         Ok(Tracker {
@@ -238,6 +271,30 @@ impl Tracker {
             .pending_mode
             .store(mode as u32 | PENDING_SET, Ordering::Release);
         0
+    }
+
+    /// The angular rate the reader last observed, in radians per second, body
+    /// frame. Measured from the raw stream where it runs, differentiated from
+    /// the pose stream otherwise.
+    pub fn angular_rate(&self) -> [f32; 3] {
+        Hot::load_vec3(&self.hot.gyro)
+    }
+
+    /// Extrapolates an orientation forward by `dt` seconds at the current
+    /// angular rate.
+    ///
+    /// This is what closes the gap between where the head was when a pose was
+    /// sampled and where it will be when the frame reaches the panel — a pose is
+    /// a few milliseconds old before it is read, and the frame built from it is
+    /// two or three refreshes from being seen. Left uncorrected, that shows up
+    /// as the whole world sliding a little behind every head turn.
+    ///
+    /// The caller passes the orientation rather than having it read here so that
+    /// a renderer can predict the frame it is about to draw from the pose it has
+    /// already recentred. Body-frame rate is unaffected by recentring, which
+    /// left-multiplies by a fixed world rotation, so the same rate applies.
+    pub fn predict(&self, q: [f32; 4], dt: f32) -> [f32; 4] {
+        integrate(q, self.angular_rate(), dt)
     }
 
     /// True once per new pose sample; clears the flag.
@@ -325,8 +382,15 @@ impl Drop for Tracker {
     }
 }
 
-fn read_loop<T: Transport>(mut dev: Device<T>, hot: Arc<Hot>, stop: Arc<AtomicBool>) {
+fn read_loop<T: Transport>(
+    mut dev: Device<T>,
+    hot: Arc<Hot>,
+    stop: Arc<AtomicBool>,
+    raw_stream: bool,
+) {
     hot.reader_alive.store(true, Ordering::Release);
+    // Previous pose and when it arrived, for estimating angular rate.
+    let mut previous: Option<([f32; 4], std::time::Instant)> = None;
     while !stop.load(Ordering::Relaxed) {
         // Send a queued display-mode change between reads — the only place the
         // transport is free.
@@ -339,6 +403,40 @@ fn read_loop<T: Transport>(mut dev: Device<T>, hot: Arc<Hot>, stop: Arc<AtomicBo
                 Hot::store_quat(&hot.head, p.q);
                 hot.head_samples.fetch_add(1, Ordering::Relaxed);
                 hot.fresh.store(true, Ordering::Release);
+
+                // Angular rate, differentiated from the pose stream.
+                //
+                // The device can report rates directly, but only on the raw
+                // stream, and asking for pose and raw together makes it ACK the
+                // request and then send nothing at all — see `Tracker::open`. So
+                // the rate is recovered from the poses instead, which arrive at
+                // 120 Hz and are all that is needed to predict a few tens of
+                // milliseconds ahead.
+                //
+                // Skipped when the raw stream is running, because then the
+                // device's own measurements are better than a difference.
+                let now = std::time::Instant::now();
+                if !raw_stream {
+                    if let Some((before, then)) = previous {
+                        let dt = now.duration_since(then).as_secs_f32();
+                        // Below a tenth of a millisecond the division amplifies
+                        // quantisation into noise; above a tenth of a second the
+                        // stream has stalled and the old rate is meaningless.
+                        if (1e-4..0.1).contains(&dt) {
+                            let measured = angular_rate(before, p.q, dt);
+                            for (a, v) in hot.gyro.iter().zip(measured) {
+                                let last = f32::from_bits(a.load(Ordering::Relaxed));
+                                // A light low-pass. Differentiating amplifies the
+                                // jitter in each sample, and prediction turns rate
+                                // noise into a visibly restless image; this trades
+                                // a sample of lag for a steady one.
+                                let smoothed = last + (v - last) * RATE_SMOOTHING;
+                                a.store(smoothed.to_bits(), Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    previous = Some((p.q, now));
+                }
             }
             Ok(Some(Event::Raw(r))) => {
                 for (a, v) in hot.gyro.iter().zip(r.gyro) {
@@ -485,6 +583,49 @@ pub unsafe extern "C" fn xr_pose7(t: *mut Tracker, out: *mut f32) -> i32 {
 ///
 /// # Safety
 /// `t` must be live.
+/// Extrapolates `[w, x, y, z]` forward by `dt_seconds` at the tracker's current
+/// angular rate, writing the result to `out`.
+///
+/// # Safety
+/// `out` must point to four writable, aligned `f32`s.
+#[no_mangle]
+pub unsafe extern "C" fn xr_predict(
+    t: *mut Tracker,
+    w: f32,
+    x: f32,
+    y: f32,
+    z: f32,
+    dt_seconds: f32,
+    out: *mut f32,
+) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    let Some(t) = t.as_ref() else { return -1 };
+    let q = t.predict([w, x, y, z], dt_seconds);
+    std::ptr::copy_nonoverlapping(q.as_ptr(), out, 4);
+    0
+}
+
+/// The tracker's current angular rate, radians per second, body frame.
+///
+/// # Safety
+/// `out` must point to three writable, aligned `f32`s.
+#[no_mangle]
+pub unsafe extern "C" fn xr_angular_rate(t: *mut Tracker, out: *mut f32) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    let Some(t) = t.as_ref() else { return -1 };
+    let r = t.angular_rate();
+    std::ptr::copy_nonoverlapping(r.as_ptr(), out, 3);
+    0
+}
+
+/// True once per new pose sample, then false until the next one.
+///
+/// # Safety
+/// `t` must be a tracker from [`xr_open`], or null.
 #[no_mangle]
 pub unsafe extern "C" fn xr_pose_fresh(t: *mut Tracker) -> i32 {
     t.as_ref().map(|t| t.pose_fresh() as i32).unwrap_or(0)
@@ -578,6 +719,67 @@ mod tests {
     }
 
     /// A constant rate about Z for dt must rotate by exactly omega * dt.
+    #[test]
+    fn angular_rate_recovers_a_known_turn() {
+        // Half a second of yawing at 1 rad/s, sampled 8 ms apart, must read back
+        // as 1 rad/s about Y. This is the measurement prediction rests on when
+        // the device will not stream its own rates.
+        let dt = 1.0 / 120.0;
+        let at = |t: f32| {
+            let half = 0.5 * t; // 1 rad/s
+            [half.cos(), 0.0, half.sin(), 0.0]
+        };
+        let rate = angular_rate(at(0.5), at(0.5 + dt), dt);
+        assert!(rate[0].abs() < 1e-3, "x {}", rate[0]);
+        assert!((rate[1] - 1.0).abs() < 1e-3, "y {}", rate[1]);
+        assert!(rate[2].abs() < 1e-3, "z {}", rate[2]);
+    }
+
+    #[test]
+    fn angular_rate_ignores_the_sign_of_the_quaternion() {
+        // q and -q are the same orientation. Reading the difference between them
+        // literally gives half a turn in one sample, which would send the
+        // prediction across the room.
+        let dt = 1.0 / 120.0;
+        let a = [0.9999, 0.0, 0.0139, 0.0];
+        let b = [-0.9998, 0.0, -0.0208, 0.0];
+        let rate = angular_rate(a, b, dt);
+        let speed = (rate[0] * rate[0] + rate[1] * rate[1] + rate[2] * rate[2]).sqrt();
+        assert!(speed < 5.0, "flipped sign read as {speed} rad/s");
+    }
+
+    #[test]
+    fn a_still_head_has_no_rate() {
+        let q = [
+            std::f32::consts::FRAC_1_SQRT_2,
+            0.0,
+            std::f32::consts::FRAC_1_SQRT_2,
+            0.0,
+        ];
+        let rate = angular_rate(q, q, 1.0 / 120.0);
+        assert!(rate.iter().all(|v| v.abs() < 1e-5), "{rate:?}");
+    }
+
+    #[test]
+    fn prediction_leads_a_steady_turn() {
+        // Extrapolating by dt from a pose must land where the head actually is
+        // dt later. This is the whole point: without it the image trails the
+        // head by the length of the display pipeline.
+        let dt = 0.030;
+        let at = |t: f32| {
+            let half = 0.5 * t;
+            [half.cos(), 0.0, half.sin(), 0.0]
+        };
+        let predicted = integrate(at(0.0), [0.0, 1.0, 0.0], dt);
+        let actual = at(dt);
+        for (p, a) in predicted.iter().zip(actual) {
+            assert!(
+                (p - a).abs() < 1e-4,
+                "predicted {predicted:?} actual {actual:?}"
+            );
+        }
+    }
+
     #[test]
     fn constant_rate_rotates_by_omega_dt() {
         let omega = [0.0, 0.0, 1.0]; // 1 rad/s
