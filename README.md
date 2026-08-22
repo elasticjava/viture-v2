@@ -68,6 +68,29 @@ The syscall layer is written directly in inline assembly for x86-64 and aarch64,
 why the crate needs neither `libc` nor a build script. That also makes cross-compiling
 trivial — there is no C anywhere.
 
+### The `render` feature
+
+Off by default, and the only thing in the crate with a dependency. It carries the two
+halves of 360° playback that are worth computing below a JNI or FFI boundary:
+
+- **the sphere** — an inside-out equirectangular mesh, written straight into a
+  caller-owned buffer. The seam column is duplicated so the texture never wraps across a
+  triangle, the degenerate polar triangles are dropped, and the winding is
+  counter-clockwise *seen from the centre* so back-face culling can stay on. All three are
+  asserted in tests; winding in particular is invisible in review and fails as a black
+  screen.
+- **the camera** — a view-projection from a head orientation, column-major and ready for
+  `glUniformMatrix4fv`. The orientation is an argument rather than a read from the tracker,
+  so a caller can build its scene and its panorama from exactly one sample; two reads a
+  frame apart shear the video against anything drawn over it.
+
+Stereoscopic 360° is a texture window, not a camera offset — `uv_window` returns the half
+of the frame one eye samples. The depth is already in the two images; displacing the
+camera inside the sphere would add parallax against geometry that is not there.
+
+[`glam`](https://github.com/bitshifter/glam-rs) supplies the matrix and quaternion
+routines. The default build stays dependency-free, and CI enforces that.
+
 ## Measurements
 
 Pro 2 XR, raw stream at 1000 Hz requested (~770–795 Hz delivered over a USB/IP link):
@@ -141,8 +164,9 @@ SUBSYSTEM=="hidraw", ATTRS{idVendor}=="35ca", MODE="0660", GROUP="plugdev"
 
 ```
 cargo build --release
-cargo test
+cargo test --all-features
 cargo build --release --target aarch64-unknown-linux-musl   # static, runs on Android
+cargo build --release --target aarch64-linux-android --features render   # for an app
 ```
 
 ## tools/
