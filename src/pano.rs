@@ -98,11 +98,6 @@ impl Projection {
             Projection::Equirect180 => std::f32::consts::PI,
         }
     }
-
-    /// Whether the last column of the grid meets the first.
-    fn wraps(self) -> bool {
-        self == Projection::Equirect360
-    }
 }
 
 /// Which eye a frame is being drawn for.
