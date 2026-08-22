@@ -173,10 +173,15 @@ pub fn vertical_fov(diagonal_deg: f32, aspect: f32) -> f32 {
     2.0 * half_height.atan().to_degrees()
 }
 
-/// The sphere is unit-radius and drawn without depth, so the near and far
-/// planes only have to bracket it.
+/// The clipping planes.
+///
+/// The far plane used to be 4.0, chosen when the only thing drawn was a
+/// unit-radius sphere. A screen stands at four metres by default, which put it
+/// exactly on that plane and clipped it away. Nothing here is depth-tested, so
+/// the planes cost nothing but have to contain what is drawn — with room for a
+/// screen pushed further back than the default.
 const NEAR: f32 = 0.05;
-const FAR: f32 = 4.0;
+const FAR: f32 = 100.0;
 
 /// Floats per vertex: three of position, two of texture coordinate.
 pub const VERTEX_FLOATS: usize = 5;
@@ -981,6 +986,36 @@ mod tests {
         // The normal must point back towards the viewer at the origin.
         let facing = n[0] * a[0] + n[1] * a[1] + n[2] * a[2];
         assert!(facing < 0.0, "the screen faces away ({facing})");
+    }
+
+    #[test]
+    fn a_screen_at_its_default_distance_is_inside_the_frustum() {
+        // The far plane was four metres, chosen for a unit sphere, and a screen
+        // stands at four metres — so the default screen sat exactly on it. A
+        // point on the plane is on the boundary of what survives clipping, which
+        // is not a place to leave the thing the viewer is looking at.
+        let mut verts = vec![0.0f32; screen_vertex_count(32) * VERTEX_FLOATS];
+        screen_mesh(
+            32,
+            DEFAULT_SCREEN_DISTANCE,
+            DEFAULT_SCREEN_WIDTH_DEG,
+            16.0 / 9.0,
+            0.0,
+            &mut verts,
+        )
+        .unwrap();
+        let mut mvp = [0.0f32; 16];
+        view_projection([1.0, 0.0, 0.0, 0.0], DEFAULT_FOV_DEG, 16.0 / 9.0, &mut mvp);
+        for c in verts.as_chunks::<VERTEX_FLOATS>().0 {
+            let w = mvp[3] * c[0] + mvp[7] * c[1] + mvp[11] * c[2] + mvp[15];
+            let z = mvp[2] * c[0] + mvp[6] * c[1] + mvp[10] * c[2] + mvp[14];
+            assert!(w > 0.0, "a screen vertex fell behind the eye");
+            let depth = z / w;
+            assert!(
+                (-1.0..1.0).contains(&depth),
+                "a screen vertex clipped at depth {depth}",
+            );
+        }
     }
 
     #[test]
