@@ -1,0 +1,663 @@
+//! Panorama geometry and camera maths for 360° playback.
+//!
+//! A 360° video is an equirectangular image: longitude across, latitude down.
+//! Playing it back means texturing the inside of a sphere with it and putting
+//! the camera at the centre, so the work splits into two halves — build the
+//! sphere once, and produce one matrix per frame.
+//!
+//! Both halves live here rather than in the renderer because both are hot in
+//! their own way. The mesh is 8k vertices that a managed runtime would build
+//! element by element into a boxed buffer; the matrix is needed every frame for
+//! every eye, and computing it above the JNI boundary means a pose array
+//! allocation and four matrix calls per frame that no one profiles.
+//!
+//! # Conventions
+//!
+//! Right-handed world space: `+X` right, `+Y` up, `−Z` forward. Equirectangular
+//! texture space: `u` runs left to right, `v` runs top to bottom, so `v = 0` is
+//! the zenith. The image centre `(0.5, 0.5)` sits straight ahead at `−Z`, which
+//! is where a viewer looks when the video starts, and increasing `u` sweeps to
+//! the right.
+//!
+//! The sphere is wound so that its triangles are counter-clockwise *seen from
+//! the centre*. Back-face culling can therefore stay on, which halves the
+//! fragment work: without it the GPU shades the far wall of the sphere and then
+//! throws it away.
+
+use glam::camera::rh::proj::opengl;
+use glam::{Mat4, Quat, Vec3};
+
+/// How a stereoscopic 360° frame packs its two eyes.
+///
+/// There is no metadata channel here that says which one a file uses — the
+/// convention lives in the filename, the container's stereo mode box, or the
+/// site it came from. Over-under is what most 3D 360° material uses, because
+/// halving vertical resolution costs less than halving horizontal on content
+/// that is twice as wide as it is tall.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum StereoLayout {
+    /// One image for both eyes. Depth comes from nothing; the scene is a flat
+    /// sphere, which is still the right choice for the vast majority of 360°
+    /// footage.
+    Mono = 0,
+    /// Left eye in the top half, right eye in the bottom.
+    OverUnder = 1,
+    /// Left eye in the left half, right eye in the right.
+    SideBySide = 2,
+}
+
+impl StereoLayout {
+    pub fn from_raw(v: u32) -> StereoLayout {
+        match v {
+            1 => StereoLayout::OverUnder,
+            2 => StereoLayout::SideBySide,
+            _ => StereoLayout::Mono,
+        }
+    }
+}
+
+/// Which eye a frame is being drawn for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(i32)]
+pub enum Eye {
+    Left = 0,
+    Right = 1,
+}
+
+/// Field of view limits, in degrees of vertical angle.
+///
+/// The glasses' optics span about 46° vertically, so the neutral value is the
+/// one that makes the panorama look life-size. Zooming in narrows the angle;
+/// below ten degrees the head tracking's own jitter becomes the dominant motion
+/// on screen and the image feels unstable, which is where the floor comes from.
+pub const MIN_FOV_DEG: f32 = 10.0;
+pub const MAX_FOV_DEG: f32 = 100.0;
+pub const DEFAULT_FOV_DEG: f32 = 46.0;
+
+/// The sphere is unit-radius and drawn without depth, so the near and far
+/// planes only have to bracket it.
+const NEAR: f32 = 0.05;
+const FAR: f32 = 4.0;
+
+/// Floats per vertex: three of position, two of texture coordinate.
+pub const VERTEX_FLOATS: usize = 5;
+
+/// Beyond this the 16-bit index buffer cannot address the mesh. 16-bit indices
+/// halve index bandwidth and are what mobile GPUs are tuned for, so the limit
+/// is worth keeping rather than widening to 32-bit.
+const MAX_VERTICES: usize = 65_536;
+
+/// Number of vertices [`sphere_mesh`] will write for this tessellation.
+///
+/// Both grid dimensions get one extra line: the last latitude closes the sphere
+/// at the south pole, and the last longitude duplicates the first at `u = 1`.
+/// The duplicate is the whole reason there is no visible seam behind the
+/// viewer — sharing that column would make the texture coordinate jump from
+/// nearly 1 back to 0 across one triangle, and the hardware would interpolate
+/// the entire image across it.
+pub const fn vertex_count(rings: u32, sectors: u32) -> usize {
+    (rings as usize + 1) * (sectors as usize + 1)
+}
+
+/// Number of indices [`sphere_indices`] will write for this tessellation.
+///
+/// Two triangles per grid cell, except along the two polar rows where one
+/// corner of the cell collapses onto the pole and one of the two triangles has
+/// no area. Those are skipped: a degenerate triangle costs a primitive-assembly
+/// slot for nothing.
+pub const fn index_count(rings: u32, sectors: u32) -> usize {
+    if rings < 2 {
+        return 0;
+    }
+    6 * (rings as usize - 1) * sectors as usize
+}
+
+/// Writes an inside-out UV sphere as interleaved `[x, y, z, u, v]` vertices.
+///
+/// Returns the number of vertices written, or `None` if the tessellation is
+/// unusable — fewer than two rings or three sectors makes no closed surface,
+/// more than 65 536 vertices cannot be indexed, and a short output slice would
+/// leave a half-built mesh behind.
+///
+/// `rings` counts latitude bands and `sectors` counts longitude bands. 64 × 128
+/// is a good default: the residual faceting is finer than the panel resolves,
+/// and the whole mesh is under 200 kB.
+pub fn sphere_mesh(rings: u32, sectors: u32, radius: f32, out: &mut [f32]) -> Option<usize> {
+    let count = vertex_count(rings, sectors);
+    if rings < 2 || sectors < 3 || count > MAX_VERTICES || out.len() < count * VERTEX_FLOATS {
+        return None;
+    }
+
+    let mut w = 0;
+    for ring in 0..=rings {
+        let v = ring as f32 / rings as f32;
+        // Latitude, +π/2 at the zenith so that v = 0 is up.
+        let lat = (0.5 - v) * std::f32::consts::PI;
+        let (sin_lat, cos_lat) = lat.sin_cos();
+        let y = radius * sin_lat;
+        // Radius of this latitude's circle.
+        let r = radius * cos_lat;
+
+        for sector in 0..=sectors {
+            let u = sector as f32 / sectors as f32;
+            // Longitude, zero straight ahead so the image centre is straight ahead.
+            let lon = (u - 0.5) * std::f32::consts::TAU;
+            let (sin_lon, cos_lon) = lon.sin_cos();
+
+            out[w] = r * sin_lon;
+            out[w + 1] = y;
+            out[w + 2] = -r * cos_lon;
+            out[w + 3] = u;
+            out[w + 4] = v;
+            w += VERTEX_FLOATS;
+        }
+    }
+    Some(count)
+}
+
+/// Writes the triangle indices for a [`sphere_mesh`] of the same tessellation.
+///
+/// Returns the number of indices written, or `None` on the same conditions as
+/// [`sphere_mesh`].
+pub fn sphere_indices(rings: u32, sectors: u32, out: &mut [u16]) -> Option<usize> {
+    let count = index_count(rings, sectors);
+    if rings < 2 || sectors < 3 || vertex_count(rings, sectors) > MAX_VERTICES || out.len() < count
+    {
+        return None;
+    }
+
+    let stride = sectors + 1;
+    let mut w = 0;
+    for ring in 0..rings {
+        // a --- b   ring
+        // |     |
+        // c --- d   ring + 1
+        for sector in 0..sectors {
+            let a = (ring * stride + sector) as u16;
+            let b = a + 1;
+            let c = a + stride as u16;
+            let d = c + 1;
+
+            // At the zenith a and b are the same point, at the nadir c and d
+            // are — so one triangle of the cell is degenerate and dropped.
+            if ring > 0 {
+                out[w] = a;
+                out[w + 1] = d;
+                out[w + 2] = b;
+                w += 3;
+            }
+            if ring + 1 < rings {
+                out[w] = a;
+                out[w + 1] = c;
+                out[w + 2] = d;
+                w += 3;
+            }
+        }
+    }
+    debug_assert_eq!(w, count);
+    Some(count)
+}
+
+/// The texture window one eye samples, as `[u_scale, u_offset, v_scale, v_offset]`.
+///
+/// Apply it to the sphere's texture coordinate: `uv' = uv * scale + offset`. For
+/// [`StereoLayout::Mono`] it is the identity, so the same shader serves both
+/// mono and stereo material without a branch.
+pub fn uv_window(layout: StereoLayout, eye: Eye) -> [f32; 4] {
+    let second = eye == Eye::Right;
+    match layout {
+        StereoLayout::Mono => [1.0, 0.0, 1.0, 0.0],
+        StereoLayout::OverUnder => [1.0, 0.0, 0.5, if second { 0.5 } else { 0.0 }],
+        StereoLayout::SideBySide => [0.5, if second { 0.5 } else { 0.0 }, 1.0, 0.0],
+    }
+}
+
+/// Maps a zoom factor to a vertical field of view, in degrees.
+///
+/// Zooming a panorama is not a scale — there is nothing to move the camera
+/// towards, since the image is at infinity — it is a narrowing of the view
+/// angle, exactly like a lens. Dividing the neutral angle by the factor makes
+/// the mapping feel proportional to the pinch: doubling the zoom halves the
+/// visible arc, which is what a 2× lens does.
+pub fn fov_for_zoom(zoom: f32) -> f32 {
+    if !zoom.is_finite() || zoom <= 0.0 {
+        return DEFAULT_FOV_DEG;
+    }
+    (DEFAULT_FOV_DEG / zoom).clamp(MIN_FOV_DEG, MAX_FOV_DEG)
+}
+
+/// The zoom factor a field of view corresponds to — the inverse of
+/// [`fov_for_zoom`], for reporting the current level back to the interface.
+pub fn zoom_for_fov(fov_deg: f32) -> f32 {
+    if !fov_deg.is_finite() || fov_deg <= 0.0 {
+        return 1.0;
+    }
+    DEFAULT_FOV_DEG / fov_deg
+}
+
+/// Writes the view-projection matrix for a panorama, in column-major order
+/// ready for `glUniformMatrix4fv`.
+///
+/// `head` is the orientation of the glasses as `[w, x, y, z]`; the camera sits
+/// at the centre of the sphere and only turns, so the view transform is the
+/// inverse of that rotation and carries no translation.
+///
+/// There is deliberately no eye offset. Stereo 360° depth comes from the two
+/// images in the frame, not from displacing the camera: the sphere is at a
+/// fixed radius with the same geometry for both eyes, so shifting the camera
+/// sideways inside it produces parallax against a wall that is not really
+/// there — every object in the scene would appear at the sphere's radius, and
+/// the disparity already encoded in the footage would fight it. Both eyes get
+/// this matrix and differ only in [`uv_window`].
+pub fn view_projection(head: [f32; 4], fov_y_deg: f32, aspect: f32, out: &mut [f32; 16]) {
+    let [w, x, y, z] = head;
+    let q = Quat::from_xyzw(x, y, z, w).normalize();
+    // World-to-view is the inverse of the head's world orientation. For a unit
+    // quaternion that is the conjugate, which `inverse` reduces to.
+    let view = Mat4::from_quat(q.inverse());
+    let fov = fov_y_deg.clamp(MIN_FOV_DEG, MAX_FOV_DEG).to_radians();
+    let aspect = if aspect.is_finite() && aspect > 0.0 {
+        aspect
+    } else {
+        1.0
+    };
+    let proj = opengl::perspective(fov, aspect, NEAR, FAR);
+    out.copy_from_slice(&(proj * view).to_cols_array());
+}
+
+/// Where the viewer is looking, as a point in the equirectangular image.
+///
+/// Useful for reporting a heading in the interface, and for deciding which part
+/// of a tiled or projected source to fetch at full resolution.
+pub fn gaze_uv(head: [f32; 4]) -> [f32; 2] {
+    let [w, x, y, z] = head;
+    let q = Quat::from_xyzw(x, y, z, w).normalize();
+    let dir = q * Vec3::NEG_Z;
+    let lon = dir.x.atan2(-dir.z);
+    let lat = dir.y.clamp(-1.0, 1.0).asin();
+    [
+        (lon / std::f32::consts::TAU + 0.5).rem_euclid(1.0),
+        0.5 - lat / std::f32::consts::PI,
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// C ABI
+//
+// The renderer calls these across JNI once per frame at most, and the buffers
+// are Java direct buffers, so nothing here allocates or copies. Every function
+// validates its pointer and capacity: a wrong stride on the caller's side
+// should produce a negative return, not a half-written buffer.
+// ---------------------------------------------------------------------------
+
+/// Vertices [`xr_pano_mesh`] will write, for sizing the buffer.
+#[no_mangle]
+pub extern "C" fn xr_pano_vertex_count(rings: u32, sectors: u32) -> u32 {
+    vertex_count(rings, sectors) as u32
+}
+
+/// Indices [`xr_pano_indices`] will write, for sizing the buffer.
+#[no_mangle]
+pub extern "C" fn xr_pano_index_count(rings: u32, sectors: u32) -> u32 {
+    index_count(rings, sectors) as u32
+}
+
+/// Fills `out` with interleaved `[x, y, z, u, v]` vertices. Returns the vertex
+/// count, or -1 if the tessellation or the capacity is unusable.
+///
+/// # Safety
+/// `out` must point to `cap_floats` writable, aligned `f32`s.
+#[no_mangle]
+pub unsafe extern "C" fn xr_pano_mesh(
+    rings: u32,
+    sectors: u32,
+    radius: f32,
+    out: *mut f32,
+    cap_floats: usize,
+) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    let slice = std::slice::from_raw_parts_mut(out, cap_floats);
+    sphere_mesh(rings, sectors, radius, slice).map_or(-1, |n| n as i32)
+}
+
+/// Fills `out` with triangle indices. Returns the index count, or -1.
+///
+/// # Safety
+/// `out` must point to `cap` writable, aligned `u16`s.
+#[no_mangle]
+pub unsafe extern "C" fn xr_pano_indices(
+    rings: u32,
+    sectors: u32,
+    out: *mut u16,
+    cap: usize,
+) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    let slice = std::slice::from_raw_parts_mut(out, cap);
+    sphere_indices(rings, sectors, slice).map_or(-1, |n| n as i32)
+}
+
+/// Writes `[u_scale, u_offset, v_scale, v_offset]` for one eye of a stereo
+/// layout. `eye` is 0 for left, anything else for right.
+///
+/// # Safety
+/// `out` must point to four writable, aligned `f32`s.
+#[no_mangle]
+pub unsafe extern "C" fn xr_pano_uv(layout: u32, eye: i32, out: *mut f32) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    let eye = if eye == 0 { Eye::Left } else { Eye::Right };
+    let w = uv_window(StereoLayout::from_raw(layout), eye);
+    std::ptr::copy_nonoverlapping(w.as_ptr(), out, 4);
+    0
+}
+
+/// Writes the panorama view-projection for a head orientation, column-major and
+/// ready for `glUniformMatrix4fv`.
+///
+/// The orientation is passed in rather than read from a tracker so that the
+/// caller's scene and its panorama are built from exactly the same sample. Two
+/// independent reads a frame apart shear the video against anything drawn on
+/// top of it, and the shear tracks head speed, so it shows up precisely when it
+/// is most visible.
+///
+/// Both eyes share the result — see [`view_projection`].
+///
+/// # Safety
+/// `out` must point to sixteen writable, aligned `f32`s.
+#[no_mangle]
+pub unsafe extern "C" fn xr_pano_mvp(
+    w: f32,
+    x: f32,
+    y: f32,
+    z: f32,
+    fov_y_deg: f32,
+    aspect: f32,
+    out: *mut f32,
+) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    let mut m = [0.0f32; 16];
+    view_projection([w, x, y, z], fov_y_deg, aspect, &mut m);
+    std::ptr::copy_nonoverlapping(m.as_ptr(), out, 16);
+    0
+}
+
+/// Writes the `[u, v]` a head orientation is looking at.
+///
+/// # Safety
+/// `out` must point to two writable, aligned `f32`s.
+#[no_mangle]
+pub unsafe extern "C" fn xr_pano_gaze_uv(w: f32, x: f32, y: f32, z: f32, out: *mut f32) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    let uv = gaze_uv([w, x, y, z]);
+    std::ptr::copy_nonoverlapping(uv.as_ptr(), out, 2);
+    0
+}
+
+/// The vertical field of view, in degrees, for a zoom factor.
+#[no_mangle]
+pub extern "C" fn xr_pano_fov_for_zoom(zoom: f32) -> f32 {
+    fov_for_zoom(zoom)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RINGS: u32 = 32;
+    const SECTORS: u32 = 64;
+
+    fn build() -> (Vec<f32>, Vec<u16>) {
+        let mut verts = vec![0.0f32; vertex_count(RINGS, SECTORS) * VERTEX_FLOATS];
+        let mut idx = vec![0u16; index_count(RINGS, SECTORS)];
+        assert_eq!(
+            sphere_mesh(RINGS, SECTORS, 1.0, &mut verts),
+            Some(vertex_count(RINGS, SECTORS))
+        );
+        assert_eq!(
+            sphere_indices(RINGS, SECTORS, &mut idx),
+            Some(index_count(RINGS, SECTORS))
+        );
+        (verts, idx)
+    }
+
+    fn pos(verts: &[f32], i: u16) -> [f32; 3] {
+        let o = i as usize * VERTEX_FLOATS;
+        [verts[o], verts[o + 1], verts[o + 2]]
+    }
+
+    #[test]
+    fn every_vertex_sits_on_the_sphere() {
+        let (verts, _) = build();
+        for chunk in verts.as_chunks::<VERTEX_FLOATS>().0.iter() {
+            let r = (chunk[0] * chunk[0] + chunk[1] * chunk[1] + chunk[2] * chunk[2]).sqrt();
+            assert!((r - 1.0).abs() < 1e-4, "radius {r}");
+        }
+    }
+
+    #[test]
+    fn image_centre_is_straight_ahead() {
+        // (u, v) = (0.5, 0.5) must land on -Z, or the video starts off-centre.
+        let (verts, _) = build();
+        let mid = verts
+            .as_chunks::<VERTEX_FLOATS>()
+            .0
+            .iter()
+            .find(|c| (c[3] - 0.5).abs() < 1e-6 && (c[4] - 0.5).abs() < 1e-6)
+            .expect("the grid contains u = v = 0.5 for even ring and sector counts");
+        assert!(mid[0].abs() < 1e-5, "x {}", mid[0]);
+        assert!(mid[1].abs() < 1e-5, "y {}", mid[1]);
+        assert!((mid[2] + 1.0).abs() < 1e-5, "z {}", mid[2]);
+    }
+
+    #[test]
+    fn increasing_u_sweeps_right() {
+        let (verts, _) = build();
+        // Three quarters along is a quarter turn to the right: +X.
+        let right = verts
+            .as_chunks::<VERTEX_FLOATS>()
+            .0
+            .iter()
+            .find(|c| (c[3] - 0.75).abs() < 1e-6 && (c[4] - 0.5).abs() < 1e-6)
+            .expect("grid contains u = 0.75, v = 0.5");
+        assert!(right[0] > 0.99, "x {}", right[0]);
+    }
+
+    #[test]
+    fn zenith_is_up_and_nadir_is_down() {
+        let (verts, _) = build();
+        let top = verts
+            .as_chunks::<VERTEX_FLOATS>()
+            .0
+            .iter()
+            .find(|c| c[4] == 0.0)
+            .unwrap();
+        let bottom = verts
+            .as_chunks::<VERTEX_FLOATS>()
+            .0
+            .iter()
+            .find(|c| c[4] == 1.0)
+            .unwrap();
+        assert!((top[1] - 1.0).abs() < 1e-5, "top y {}", top[1]);
+        assert!((bottom[1] + 1.0).abs() < 1e-5, "bottom y {}", bottom[1]);
+    }
+
+    #[test]
+    fn seam_column_is_duplicated_not_wrapped() {
+        // The first and last column must be the same point with u = 0 and u = 1,
+        // otherwise the whole texture interpolates across the seam behind you.
+        let (verts, _) = build();
+        let stride = (SECTORS + 1) as usize * VERTEX_FLOATS;
+        for ring in 0..=RINGS as usize {
+            let first = ring * stride;
+            let last = first + SECTORS as usize * VERTEX_FLOATS;
+            for axis in 0..3 {
+                assert!(
+                    (verts[first + axis] - verts[last + axis]).abs() < 1e-5,
+                    "ring {ring} axis {axis} not coincident"
+                );
+            }
+            assert_eq!(verts[first + 3], 0.0);
+            assert_eq!(verts[last + 3], 1.0);
+        }
+    }
+
+    #[test]
+    fn all_triangles_face_the_centre() {
+        // The winding decides whether back-face culling shows the panorama or a
+        // black screen, and it is invisible in review — so it is asserted.
+        let (verts, idx) = build();
+        assert_eq!(idx.len() % 3, 0);
+        for (n, tri) in idx.as_chunks::<3>().0.iter().enumerate() {
+            let a = pos(&verts, tri[0]);
+            let b = pos(&verts, tri[1]);
+            let c = pos(&verts, tri[2]);
+            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let normal = [
+                ab[1] * ac[2] - ab[2] * ac[1],
+                ab[2] * ac[0] - ab[0] * ac[2],
+                ab[0] * ac[1] - ab[1] * ac[0],
+            ];
+            let area =
+                (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+            assert!(area > 1e-9, "triangle {n} is degenerate");
+            // Right-hand normal pointing back towards the origin means the
+            // triangle is counter-clockwise as seen from inside.
+            let facing = normal[0] * a[0] + normal[1] * a[1] + normal[2] * a[2];
+            assert!(facing < 0.0, "triangle {n} faces outward ({facing})");
+        }
+    }
+
+    #[test]
+    fn indices_stay_in_range() {
+        let (_, idx) = build();
+        let max = vertex_count(RINGS, SECTORS) as u16;
+        assert!(idx.iter().all(|&i| i < max));
+    }
+
+    #[test]
+    fn tessellation_is_validated() {
+        let mut verts = vec![0.0f32; 1 << 20];
+        let mut idx = vec![0u16; 1 << 20];
+        assert_eq!(sphere_mesh(1, 64, 1.0, &mut verts), None, "one ring");
+        assert_eq!(sphere_mesh(32, 2, 1.0, &mut verts), None, "two sectors");
+        assert_eq!(sphere_mesh(512, 512, 1.0, &mut verts), None, "over 16-bit");
+        assert_eq!(sphere_indices(512, 512, &mut idx), None, "over 16-bit");
+        // Short output slices are rejected rather than half-filled.
+        let mut tiny = [0.0f32; 4];
+        assert_eq!(sphere_mesh(RINGS, SECTORS, 1.0, &mut tiny), None);
+        let mut tiny_idx = [0u16; 4];
+        assert_eq!(sphere_indices(RINGS, SECTORS, &mut tiny_idx), None);
+    }
+
+    #[test]
+    fn stereo_windows_split_the_frame_without_overlap() {
+        assert_eq!(
+            uv_window(StereoLayout::Mono, Eye::Left),
+            [1.0, 0.0, 1.0, 0.0]
+        );
+        assert_eq!(
+            uv_window(StereoLayout::Mono, Eye::Right),
+            [1.0, 0.0, 1.0, 0.0]
+        );
+
+        let [_, _, vs, vl] = uv_window(StereoLayout::OverUnder, Eye::Left);
+        let [_, _, _, vr] = uv_window(StereoLayout::OverUnder, Eye::Right);
+        assert_eq!((vs, vl, vr), (0.5, 0.0, 0.5));
+
+        let [us, ul, _, _] = uv_window(StereoLayout::SideBySide, Eye::Left);
+        let [_, ur, _, _] = uv_window(StereoLayout::SideBySide, Eye::Right);
+        assert_eq!((us, ul, ur), (0.5, 0.0, 0.5));
+    }
+
+    #[test]
+    fn zoom_and_fov_are_inverses_inside_the_clamp() {
+        for zoom in [0.5f32, 1.0, 2.0, 4.0] {
+            let fov = fov_for_zoom(zoom);
+            assert!(
+                (zoom_for_fov(fov) - zoom).abs() < 1e-4,
+                "zoom {zoom} fov {fov}"
+            );
+        }
+        assert_eq!(fov_for_zoom(1.0), DEFAULT_FOV_DEG);
+        assert_eq!(fov_for_zoom(1000.0), MIN_FOV_DEG, "clamped in");
+        assert_eq!(fov_for_zoom(0.0001), MAX_FOV_DEG, "clamped out");
+        assert_eq!(fov_for_zoom(f32::NAN), DEFAULT_FOV_DEG);
+        assert_eq!(fov_for_zoom(-1.0), DEFAULT_FOV_DEG);
+    }
+
+    #[test]
+    fn identity_pose_looks_at_the_image_centre() {
+        let mut m = [0.0f32; 16];
+        view_projection([1.0, 0.0, 0.0, 0.0], DEFAULT_FOV_DEG, 16.0 / 9.0, &mut m);
+        // Straight ahead must project to the middle of the screen.
+        let p = project(&m, [0.0, 0.0, -1.0]);
+        assert!(p[0].abs() < 1e-5 && p[1].abs() < 1e-5, "centre at {p:?}");
+        // And behind the viewer must not.
+        let behind = project_raw(&m, [0.0, 0.0, 1.0]);
+        assert!(behind[3] < 0.0, "w {} should be negative behind", behind[3]);
+    }
+
+    #[test]
+    fn turning_right_moves_the_scene_left() {
+        // Yawing right by 30° must push what was ahead towards -X on screen; the
+        // opposite sign means the panorama drags with the head instead of
+        // staying put, which is the classic inverted-tracking bug.
+        let a = (30f32.to_radians() / 2.0).sin();
+        let c = (30f32.to_radians() / 2.0).cos();
+        // Right-handed yaw about +Y by -30° turns the head to its right.
+        let mut m = [0.0f32; 16];
+        view_projection([c, 0.0, -a, 0.0], DEFAULT_FOV_DEG, 16.0 / 9.0, &mut m);
+        let p = project(&m, [0.0, 0.0, -1.0]);
+        assert!(p[0] < -0.1, "image centre should slide left, got {}", p[0]);
+    }
+
+    #[test]
+    fn zooming_in_magnifies() {
+        let point = [0.2f32, 0.0, -1.0];
+        let mut wide = [0.0f32; 16];
+        let mut tight = [0.0f32; 16];
+        view_projection([1.0, 0.0, 0.0, 0.0], fov_for_zoom(1.0), 1.0, &mut wide);
+        view_projection([1.0, 0.0, 0.0, 0.0], fov_for_zoom(2.0), 1.0, &mut tight);
+        assert!(
+            project(&tight, point)[0] > project(&wide, point)[0] * 1.5,
+            "narrowing the field of view must spread the image out"
+        );
+    }
+
+    #[test]
+    fn gaze_uv_matches_the_mesh() {
+        assert_eq!(gaze_uv([1.0, 0.0, 0.0, 0.0]), [0.5, 0.5]);
+        // Same -30° yaw as above: looking right means a larger u.
+        let a = (30f32.to_radians() / 2.0).sin();
+        let c = (30f32.to_radians() / 2.0).cos();
+        let uv = gaze_uv([c, 0.0, -a, 0.0]);
+        assert!((uv[0] - (0.5 + 30.0 / 360.0)).abs() < 1e-4, "u {}", uv[0]);
+        assert!((uv[1] - 0.5).abs() < 1e-4, "v {}", uv[1]);
+    }
+
+    /// Column-major matrix times point, returning the full clip-space vector.
+    fn project_raw(m: &[f32; 16], p: [f32; 3]) -> [f32; 4] {
+        let mut out = [0.0f32; 4];
+        for row in 0..4 {
+            out[row] = m[row] * p[0] + m[4 + row] * p[1] + m[8 + row] * p[2] + m[12 + row];
+        }
+        out
+    }
+
+    /// Normalised device coordinates.
+    fn project(m: &[f32; 16], p: [f32; 3]) -> [f32; 2] {
+        let v = project_raw(m, p);
+        [v[0] / v[3], v[1] / v[3]]
+    }
+}

@@ -8,8 +8,17 @@ license = "MIT"
 [lib]
 crate-type = ["rlib", "cdylib"]
 
+[features]
+default = []
+# Panorama-Geometrie und Kameramathematik fuer den 360-Grad-Renderer.
+# Optional, damit CLI und Treiber-Hot-Path abhaengigkeitsfrei bleiben.
+render = ["glam"]
+
 [dependencies]
-# bewusst keine. Der Hot Path soll ohne Fremdcode auskommen.
+# Im Hot Path des Treibers bewusst keine. Die Render-Mathematik dagegen steht
+# auf glam: NEON-beschleunigte 4x4-Matrizen und durchgetestete Quaternion- und
+# Projektionsroutinen sind nichts, was man selbst nochmal schreiben sollte.
+glam = { version = "0.33", optional = true }
 
 [profile.release]
 opt-level = 3

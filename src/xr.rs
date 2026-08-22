@@ -528,6 +528,45 @@ pub unsafe extern "C" fn xr_firmware(t: *mut Tracker, out: *mut u8, cap: usize) 
     n as i32
 }
 
+/// Diagnostics for the JNI side: `[head_samples, phone_samples, reader_alive,
+/// reader_errno, other_events]`. Silence in the pose stream is otherwise
+/// impossible to tell apart from a dead reader thread.
+///
+/// # Safety
+/// `t` must be live and `out` must hold five `i64`s.
+#[no_mangle]
+pub unsafe extern "C" fn xr_diag(t: *mut Tracker, out: *mut i64) -> i32 {
+    let Some(t) = t.as_ref() else { return -1 };
+    if out.is_null() {
+        return -1;
+    }
+    let values = [
+        t.hot.head_samples.load(Ordering::Relaxed) as i64,
+        t.hot.phone_samples.load(Ordering::Relaxed) as i64,
+        t.hot.reader_alive.load(Ordering::Acquire) as i64,
+        t.hot.reader_errno.load(Ordering::Relaxed) as i32 as i64,
+        t.hot.other_events.load(Ordering::Relaxed) as i64,
+    ];
+    core::ptr::copy_nonoverlapping(values.as_ptr(), out, values.len());
+    0
+}
+
+/// Switches the panel's display mode. `0x31` = 1920×1080 2D, `0x32` = 3840×1080
+/// side-by-side 3D.
+///
+/// The device owns the command path from its reader thread, so this reopens a
+/// short-lived command channel rather than fighting it. Returns 0 on success.
+///
+/// # Safety
+/// `t` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn xr_set_display_mode(t: *mut Tracker, mode: u8) -> i32 {
+    match t.as_ref() {
+        Some(t) => t.request_display_mode(mode),
+        None => -1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -603,44 +642,5 @@ mod tests {
             core::mem::size_of::<XrState>(),
             4 * 4 + 4 * 4 + 4 + 4 + 4 + 4 + 8 + 8
         );
-    }
-}
-
-/// Diagnostics for the JNI side: `[head_samples, phone_samples, reader_alive,
-/// reader_errno, other_events]`. Silence in the pose stream is otherwise
-/// impossible to tell apart from a dead reader thread.
-///
-/// # Safety
-/// `t` must be live and `out` must hold five `i64`s.
-#[no_mangle]
-pub unsafe extern "C" fn xr_diag(t: *mut Tracker, out: *mut i64) -> i32 {
-    let Some(t) = t.as_ref() else { return -1 };
-    if out.is_null() {
-        return -1;
-    }
-    let values = [
-        t.hot.head_samples.load(Ordering::Relaxed) as i64,
-        t.hot.phone_samples.load(Ordering::Relaxed) as i64,
-        t.hot.reader_alive.load(Ordering::Acquire) as i64,
-        t.hot.reader_errno.load(Ordering::Relaxed) as i32 as i64,
-        t.hot.other_events.load(Ordering::Relaxed) as i64,
-    ];
-    core::ptr::copy_nonoverlapping(values.as_ptr(), out, values.len());
-    0
-}
-
-/// Switches the panel's display mode. `0x31` = 1920×1080 2D, `0x32` = 3840×1080
-/// side-by-side 3D.
-///
-/// The device owns the command path from its reader thread, so this reopens a
-/// short-lived command channel rather than fighting it. Returns 0 on success.
-///
-/// # Safety
-/// `t` must be live.
-#[no_mangle]
-pub unsafe extern "C" fn xr_set_display_mode(t: *mut Tracker, mode: u8) -> i32 {
-    match t.as_ref() {
-        Some(t) => t.request_display_mode(mode),
-        None => -1,
     }
 }
