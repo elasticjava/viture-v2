@@ -70,8 +70,25 @@ def line(name, measured, expected, verdict=""):
     print("%-3s %-26s %-22s %-22s %s" % ("7", name, measured, expected, verdict))
 
 
+def is_side_by_side(image):
+    """Whether this capture is a panel carrying two eyes.
+
+    A frame 1920 wide is one picture, and splitting it down the middle gives two
+    halves of the *same* image — which the parallax test will happily measure
+    and report as a 760-pixel disparity 900 per cent off expectation. It did.
+    Better to say the capture is not a stereo pair than to measure one that is
+    not there.
+    """
+    return image.width >= image.height * 3
+
+
 def parallax(path):
-    left, right, half = eyes(Image.open(path))
+    image = Image.open(path)
+    if not is_side_by_side(image):
+        line("eye assignment", "%dx%d, one picture" % (image.width, image.height),
+             "a side-by-side panel", "run with the panel in stereo")
+        return
+    left, right, half = eyes(image)
     a, na = centroid(left, PILLAR_RGB)
     b, nb = centroid(right, PILLAR_RGB)
     if a is None or b is None:
@@ -86,7 +103,12 @@ def parallax(path):
 
 
 def greyness(path):
-    left, right, _ = eyes(Image.open(path))
+    image = Image.open(path)
+    if not is_side_by_side(image):
+        line("anaglyph", "%dx%d, one picture" % (image.width, image.height),
+             "a side-by-side panel", "run with the panel in stereo")
+        return
+    left, right, _ = eyes(image)
     spread = float(np.abs(left[..., 0] - left[..., 1]).mean()
                    + np.abs(left[..., 1] - left[..., 2]).mean())
     between = float(np.abs(left - right).mean())

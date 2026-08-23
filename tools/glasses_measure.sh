@@ -187,8 +187,26 @@ PYEOF
     rates_sbs=$(grep -o 'supportedRefreshRates \[[^]]*\]' "$out/display-sbs.txt" | head -1 || echo '?')
     report "" "side-by-side: widest" "$widest_sbs" "3840" ""
     report "" "side-by-side: rates" "${rates_sbs#supportedRefreshRates }" "[60.0, ...]" ""
-     note "above 60 here answers the 120 Hz question — and it must be the glasses'"'"' own"
-    note "section, not the phone'"'"'s, which does run at 120"
+
+    # Back to 2D before anything else runs, and this is not tidiness.
+    #
+    # The panel re-advertises on every mode change, and Android picks from the
+    # list it then offers — which includes 640x480. Cycling modes without
+    # letting it settle walked it into exactly that, and from there the display
+    # left DisplayManager's list entirely: the glasses were still on the bus,
+    # still reporting 640x480 to dumpsys, and invisible to every app. Nothing
+    # short of unplugging them brought it back.
+    #
+    # So: one switch, one reading, one switch home, with time to settle either
+    # side.
+    "$adb" shell am start -n $ACTIVITY --ei com.uxspace.extra.DISPLAY_MODE 49 >/dev/null 2>&1 || true
+    sleep 8
+    "$adb" shell dumpsys display > "$out/display-back.txt" 2>/dev/null || true
+    back=$(viture_section "$out/display-back.txt" | grep -o '[0-9]* x [0-9]*' | head -1 || true)
+    report "" "panel back in 2D" "${back:-?}" "1920 x 1080" ""
+
+     note "above 60 here answers the 120 Hz question, and it has to come from the"
+    note "glasses own section rather than the phone, which does run at 120"
 
     lanes=$("$adb" shell dumpsys usb 2>/dev/null | grep -o 'numLanes=[0-9]*' | head -1 || echo '?')
     train=$("$adb" shell dumpsys usb 2>/dev/null | grep -o 'linkTrainingStatus=[a-z]*' | head -1 || echo '?')
@@ -261,10 +279,35 @@ if wanted 5; then
     report "" "frame gap, head turning" "$turn" "< 16.7 ms" ""
 fi
 
+# Waits for something to appear in the log, up to a limit.
+#
+# Fixed sleeps were how this waited at first, and they are a guess that has to
+# be wrong in one of two directions: too short and the measurement reads a log
+# from before the thing happened, too long and every step pays for the worst
+# case. On real hardware the wait varies by more than a factor of two, because
+# a mode change renegotiates the video link and nothing is drawn until it
+# comes back.
+#
+# Returns as soon as the pattern shows up, or after $2 seconds.
+wait_for_log() {
+    pattern=$1; limit=$2; waited=0
+    while [ "$waited" -lt "$limit" ]; do
+        if "$adb" logcat -d 2>/dev/null | grep -q "$pattern"; then return 0; fi
+        sleep 2; waited=$((waited + 2))
+    done
+    return 1
+}
+
 # --- 6. formats, each read from the file alone -------------------------------
 # No layout or projection is passed. What is being measured is whether the file
 # is understood from its own metadata, which is what a camera's file carries.
 if wanted 6; then
+    # In 2D, deliberately. What this step measures is whether a file is
+    # understood from its own metadata, and that happens before anything is
+    # drawn — the panel's mode has no bearing on it. Asking for stereo here
+    # cost four video-link renegotiations in a row, and the panel does not
+    # survive that: it comes back offering 640x480 and nothing else. Step 7
+    # switches once, for the two measurements that genuinely need two eyes.
     check_format() {
         file=$1; want_stereo=$2; want_bounds=$3; tag=$4
         if ! "$adb" shell test -f "$MOVIES/$file" 2>/dev/null; then
@@ -274,7 +317,9 @@ if wanted 6; then
         stop_app; sleep 1; logcat_clear
         "$adb" shell am start -a android.intent.action.VIEW -d "file://$MOVIES/$file" \
             -t video/mp4 -n $ACTIVITY $EXTRAS >/dev/null 2>&1 || true
-        sleep 14
+        # Until the format is actually reported, rather than for a fixed guess.
+        wait_for_log 'stereoMode=' 40 || true
+        sleep 2
         "$adb" logcat -d > "$out/format-$tag.log" 2>/dev/null || true
         got_stereo=$(grep -o 'stereoMode=-\?[0-9]*' "$out/format-$tag.log" | tail -1 | cut -d= -f2 || echo '?')
         got_bounds=$(grep -o 'bounds [0-9., ]*' "$out/format-$tag.log" | tail -1 | sed 's/bounds //' || echo '?')
@@ -303,6 +348,55 @@ fi
 # proves the channels reach the right eyes: swapped, near objects diverge
 # instead of converging, and the sign flips.
 if wanted 7; then
+    # The two measurements that need two eyes get the panel put into
+    # side-by-side once, together, and it is put back afterwards. Once —
+    # every switch renegotiates the video link, and the panel answers a rapid
+    # series of them by dropping to 640x480 and staying there.
+    if [ "$MODE" = real ]; then
+        recapture_in_stereo() {
+            file=$1; tag=$2
+            got=""
+            "$adb" shell test -f "$MOVIES/$file" 2>/dev/null || return 0
+            stop_app; sleep 1
+            "$adb" shell am start -a android.intent.action.VIEW -d "file://$MOVIES/$file" \
+                -t video/mp4 -n $ACTIVITY $EXTRAS --ez com.uxspace.extra.STEREO true \
+                >/dev/null 2>&1 || true
+            # Two things have to happen, and the second is the slow one: the
+            # file has to be understood, and the panel has to come back from
+            # renegotiating the video link into side-by-side.
+            wait_for_log 'stereoMode=' 40 || true
+            waited=0
+            while [ "$waited" -lt 40 ]; do
+                got=$("$adb" shell dumpsys display 2>/dev/null | grep '"VITURE"' | head -1 \
+                      | tr ',' '\n' | grep -oE '[0-9]{3,4} x [0-9]{3,4}' | head -1)
+                case "$got" in 3840*) break ;; esac
+                sleep 2; waited=$((waited + 2))
+            done
+            case "$got" in
+                3840*) ;;
+                *)
+                    # Refuse rather than photograph. A capture taken while the
+                    # panel is anywhere else is not a stereo pair, and measuring
+                    # it produces a confident number about nothing — which is
+                    # worse than no number, because it gets believed.
+                    report 7 "$tag" "panel at ${got:-nothing}" "3840 x 1080" \
+                        "the panel would not go side-by-side"
+                    return 0
+                    ;;
+            esac
+            sleep 3
+            "$adb" shell screencap -d "$physid" -p /sdcard/_shot.png >/dev/null 2>&1 || true
+            "$adb" pull /sdcard/_shot.png "$out/$tag.png" >/dev/null 2>&1 || true
+        }
+        recapture_in_stereo ods_360_3d_tagged.mp4 ods360
+        recapture_in_stereo ibiza_anaglyph.mp4    anaglyph
+        # Back to 2D, whatever happened above. Leaving the glasses split is a
+        # bad state to hand back: every later run starts by disagreeing with it.
+        stop_app; sleep 1
+        "$adb" shell am start -n $ACTIVITY --ez com.uxspace.extra.STEREO false \
+            >/dev/null 2>&1 || true
+        sleep 8
+    fi
     if [ -f "$here/analyse_captures.py" ]; then
         python3 "$here/analyse_captures.py" "$out" | tee -a "$out/summary.txt"
     else
@@ -328,7 +422,12 @@ printf -- '---------------------------------------------------------------------
 
 # --- the mock, for comparison ------------------------------------------------
 baseline="$here/measurements/baseline-mock.tsv"
-if [ "$MODE" = mock ]; then
+if [ ! -f "$out/results.tsv" ]; then
+    # Steps that report only in prose — step 7 is one — leave nothing to compare.
+    # Running one of them on its own is a normal thing to want, and it used to
+    # end in a Python traceback about a missing file.
+    printf '\nNothing tabular in this run to compare against the mock.\n' | tee -a "$out/summary.txt"
+elif [ "$MODE" = mock ]; then
     cp "$out/results.tsv" "$baseline"
     printf 'Baseline written to %s — real runs compare against it.\n' "$baseline"
 elif [ -f "$baseline" ]; then

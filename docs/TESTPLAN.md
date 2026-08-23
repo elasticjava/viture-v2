@@ -28,6 +28,34 @@ The app's simulated panel is only ever created by an explicit intent extra, and
 the runner passes it only in `--mock`. There is no path where a real run reaches
 one by accident.
 
+## Three things that will otherwise cost you an evening
+
+**The phone dozes, and adb goes with it.** Handing the display to the glasses
+puts the phone's own display group to sleep — which is the whole point, and it
+also puts the wifi to sleep, so a run over wireless adb loses the device
+mid-measurement. The symptoms look like app failures: empty logs, missing
+captures, formats reported as `st3d=` with nothing after it. Before a run:
+
+```sh
+adb shell dumpsys deviceidle disable    # and `enable` again afterwards
+```
+
+It also looks alarming. A phone that is dozing, blanked by the app and off the
+network is indistinguishable from a dead one — 61% battery, awake, and three
+days of uptime, showing nothing and answering nothing.
+
+**Every switch between 2D and side-by-side renegotiates the video link, and the
+panel does not survive many of them.** It comes back offering 640x480 and
+nothing else, and past a certain point it drops off `DisplayManager` entirely
+and needs unplugging. So the runner switches once, in step 7, and step 6 reads
+its four formats in 2D — the metadata is parsed before anything is drawn, so
+the panel's mode has no bearing on it.
+
+**Runs happen on battery.** The phone has one USB-C port and the glasses are in
+it, so there is no charging during a session, and the glasses are the largest
+load on the system. Check the level first and keep runs short; an hour of
+measuring costs more than you would guess.
+
 ## Before the first run
 
 Push the test material and the benchmark once:
