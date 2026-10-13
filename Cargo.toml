@@ -21,7 +21,7 @@ sim = []
 # Im Hot Path des Treibers bewusst keine. Die Render-Mathematik dagegen steht
 # auf glam: NEON-beschleunigte 4x4-Matrizen und durchgetestete Quaternion- und
 # Projektionsroutinen sind nichts, was man selbst nochmal schreiben sollte.
-glam = { version = "0.33", optional = true }
+glam = { version = "0.34", optional = true }
 # Inflate for mesh projections, which the format stores deflated. Pure Rust,
 # so cross-compiling stays a one-liner.
 miniz_oxide = { version = "0.9", optional = true }
